@@ -42,7 +42,10 @@ FONT_BOLD  = ("Segoe UI", 13, "bold")
 FONT_SM    = ("Segoe UI", 11)
 FONT_TITLE = ("Segoe UI", 17, "bold")
 
-_REG_KEY = r"Software\PasswordManager"
+_REG_KEY          = r"Software\PasswordManager"
+_UNINSTALL_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\PasswordManager"
+_APP_VERSION       = "1.0"
+_PUBLISHER         = "Joshua Pechan"
 
 
 # ── Registry helpers ──────────────────────────────────────────────────────────
@@ -59,16 +62,31 @@ def _reg_read() -> tuple[str, str] | tuple[None, None]:
         return None, None
 
 
-def _reg_write(install_dir: str, ext_dir: str) -> None:
+def _reg_write(install_dir: str, ext_dir: str, uninstall_exe: str) -> None:
     key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, _REG_KEY)
     winreg.SetValueEx(key, "InstallPath",   0, winreg.REG_SZ, install_dir)
     winreg.SetValueEx(key, "ExtensionPath", 0, winreg.REG_SZ, ext_dir)
     winreg.CloseKey(key)
 
+    ukey = winreg.CreateKey(winreg.HKEY_CURRENT_USER, _UNINSTALL_REG_KEY)
+    winreg.SetValueEx(ukey, "DisplayName",     0, winreg.REG_SZ,   "Password Manager")
+    winreg.SetValueEx(ukey, "DisplayVersion",  0, winreg.REG_SZ,   _APP_VERSION)
+    winreg.SetValueEx(ukey, "Publisher",       0, winreg.REG_SZ,   _PUBLISHER)
+    winreg.SetValueEx(ukey, "InstallLocation", 0, winreg.REG_SZ,   install_dir)
+    winreg.SetValueEx(ukey, "UninstallString", 0, winreg.REG_SZ,   f'"{uninstall_exe}"')
+    winreg.SetValueEx(ukey, "DisplayIcon",     0, winreg.REG_SZ,   f'"{install_dir}\\PasswordManager.exe"')
+    winreg.SetValueEx(ukey, "NoModify",        0, winreg.REG_DWORD, 1)
+    winreg.SetValueEx(ukey, "NoRepair",        0, winreg.REG_DWORD, 1)
+    winreg.CloseKey(ukey)
+
 
 def _reg_delete() -> None:
     try:
         winreg.DeleteKey(winreg.HKEY_CURRENT_USER, _REG_KEY)
+    except FileNotFoundError:
+        pass
+    try:
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, _UNINSTALL_REG_KEY)
     except FileNotFoundError:
         pass
 
@@ -129,7 +147,7 @@ class InstallerApp(ctk.CTk):
 
         existing_install, existing_ext = _reg_read()
         if existing_install and pathlib.Path(existing_install).exists():
-            self.title("Password Manager — Uninstall")
+            self.title("Password Manager — Manage")
             self.geometry("560x460")
             self._build_uninstall(existing_install, existing_ext or "")
         else:
@@ -283,8 +301,10 @@ class InstallerApp(ctk.CTk):
             install_dir.mkdir(parents=True, exist_ok=True)
 
             self.after(0, self._progress, "Copying application...", 0.30)
-            dst_exe = install_dir / "PasswordManager.exe"
+            dst_exe   = install_dir / "PasswordManager.exe"
+            dst_setup = install_dir / "PasswordManager_Setup.exe"
             shutil.copy2(_bundled("PasswordManager.exe"), dst_exe)
+            shutil.copy2(sys.executable if getattr(sys, "frozen", False) else _bundled("dist/PasswordManager_Setup.exe"), dst_setup)
 
             self.after(0, self._progress, "Copying Chrome extension...", 0.55)
             if ext_dir.exists():
@@ -304,7 +324,7 @@ class InstallerApp(ctk.CTk):
                     pass
 
             self.after(0, self._progress, "Saving install record...", 0.95)
-            _reg_write(str(install_dir), str(ext_dir))
+            _reg_write(str(install_dir), str(ext_dir), str(dst_setup))
 
             self.after(0, self._progress, "Installation complete!", 1.00)
             self.after(0, self._install_done, dst_exe, ext_dir)
@@ -340,7 +360,7 @@ class InstallerApp(ctk.CTk):
         hdr = ctk.CTkFrame(self, height=62, fg_color=HEADER_BG, corner_radius=0)
         hdr.pack(fill="x")
         hdr.pack_propagate(False)
-        ctk.CTkLabel(hdr, text="Password Manager  —  Uninstall",
+        ctk.CTkLabel(hdr, text="Password Manager  —  Manage Installation",
                      font=FONT_TITLE, text_color=TEXT).pack(side="left", padx=20)
 
         body = ctk.CTkFrame(self, fg_color="transparent")
@@ -379,10 +399,14 @@ class InstallerApp(ctk.CTk):
                       fg_color="transparent", border_width=1, border_color=BORDER,
                       hover_color=SURFACE, text_color=TEXT2,
                       command=self.destroy).pack(side="left")
-        self._u_btn = ctk.CTkButton(btns, text="Uninstall", width=140, height=40,
+        self._u_btn = ctk.CTkButton(btns, text="Uninstall", width=120, height=40,
                                      font=FONT_BOLD, fg_color=DANGER, hover_color=DANGER_HV,
                                      command=self._uninstall_start)
         self._u_btn.pack(side="right")
+        self._r_btn = ctk.CTkButton(btns, text="Reinstall", width=120, height=40,
+                                     font=FONT_BOLD, fg_color=ACCENT, hover_color=ACCENT_HV,
+                                     command=self._reinstall_start)
+        self._r_btn.pack(side="right", padx=(0, 8))
 
     def _u_progress(self, msg: str, pct: float) -> None:
         self._u_status_lbl.configure(text=msg)
@@ -397,6 +421,7 @@ class InstallerApp(ctk.CTk):
         ):
             return
         self._u_btn.configure(state="disabled", text="Uninstalling...")
+        self._r_btn.configure(state="disabled")
         threading.Thread(target=self._uninstall_run, daemon=True).start()
 
     def _uninstall_run(self) -> None:
@@ -441,6 +466,52 @@ class InstallerApp(ctk.CTk):
         except Exception as exc:
             self.after(0, messagebox.showerror, "Uninstall Failed", str(exc))
             self.after(0, self._u_btn.configure, {"state": "normal", "text": "Uninstall"})
+            self.after(0, self._r_btn.configure, {"state": "normal"})
+
+    def _reinstall_start(self) -> None:
+        self._u_btn.configure(state="disabled")
+        self._r_btn.configure(state="disabled", text="Reinstalling...")
+        threading.Thread(target=self._reinstall_run, daemon=True).start()
+
+    def _reinstall_run(self) -> None:
+        try:
+            install_dir = pathlib.Path(self._u_install_dir)
+            ext_dir     = pathlib.Path(self._u_ext_dir) if self._u_ext_dir else None
+
+            self.after(0, self._u_progress, "Stopping application...", 0.15)
+            _kill_app()
+
+            self.after(0, self._u_progress, "Removing previous installation...", 0.40)
+            if install_dir.exists():
+                shutil.rmtree(install_dir, ignore_errors=True)
+            if ext_dir and ext_dir.exists():
+                shutil.rmtree(ext_dir, ignore_errors=True)
+
+            self.after(0, self._u_progress, "Removing shortcuts and startup...", 0.65)
+            shortcut = pathlib.Path.home() / "Desktop" / "Password Manager.lnk"
+            shortcut.unlink(missing_ok=True)
+            try:
+                _set_startup("", enable=False)
+            except Exception:
+                pass
+
+            self.after(0, self._u_progress, "Cleaning up registry...", 0.85)
+            _reg_delete()
+
+            self.after(0, self._u_progress, "Ready to reinstall.", 1.00)
+            self.after(0, self._switch_to_install)
+
+        except Exception as exc:
+            self.after(0, messagebox.showerror, "Reinstall Failed", str(exc))
+            self.after(0, self._u_btn.configure, {"state": "normal"})
+            self.after(0, self._r_btn.configure, {"state": "normal", "text": "Reinstall"})
+
+    def _switch_to_install(self) -> None:
+        for widget in self.winfo_children():
+            widget.destroy()
+        self.title("Password Manager — Setup")
+        self.geometry("560x440")
+        self._build_install()
 
     def _uninstall_done(self) -> None:
         messagebox.showinfo(
