@@ -24,8 +24,34 @@ Desktop GUI       ──►  Same database, same encryption
 
 **Option 1 — Installer (recommended)**
 
-Run `dist/PasswordManager_Setup.exe`. Choose an install location, optionally create a desktop shortcut
-and enable auto-start at login, then click **Install**. To uninstall, run the same EXE again.
+Run `dist/PasswordManager_Setup.exe`.
+
+**First run — Install wizard**
+
+1. Choose an install location (default: `%LocalAppData%\PasswordManager`).
+2. Optionally create a desktop shortcut and enable auto-start at Windows login.
+3. Click **Install →**. The wizard copies `PasswordManager.exe`, `PasswordManager_Setup.exe`,
+   and the Chrome extension into the install folder, writes registry keys, and optionally
+   creates the shortcut and startup entry.
+4. Click **Yes** when prompted to launch the app.
+
+**Re-running Setup.exe — Manage Installation**
+
+If Password Manager is already installed, running `PasswordManager_Setup.exe` again (from the
+install folder or the original download) opens the **Manage Installation** screen instead.
+It shows the current install location and Chrome extension path, and offers two actions:
+
+- **Reinstall** — stops the running app, removes all installed files, clears registry entries
+  and shortcuts, then opens the install wizard so you can pick a new location or options.
+  Your saved passwords are never touched.
+- **Uninstall** — stops the running app, removes all installed files, removes the desktop
+  shortcut and startup entry, and cleans up registry keys.
+  - Check **Also delete saved passwords and device key** to also wipe
+    `~/.password_manager/` (vault, device key, config). **This cannot be undone.**
+  - If the box is left unchecked, your vault data is kept and can be used again if you
+    reinstall later.
+  - After uninstall, remove the Chrome extension manually:
+    `chrome://extensions` → find **Password Manager** → **Remove**.
 
 **Option 2 — Build from source**
 
