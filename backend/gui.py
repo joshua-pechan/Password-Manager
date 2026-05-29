@@ -5,6 +5,7 @@ import colorsys
 import hashlib
 import http.server
 import io
+import json
 import logging
 import os
 import pathlib
@@ -14,6 +15,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import winreg
 
 if not getattr(sys, "frozen", False):
@@ -97,22 +99,30 @@ CLIP_TTL   = 30
 
 # ── App config (start-in-tray, etc.) ─────────────────────────────────────────
 
-import json as _json
-
 _CONFIG_PATH = pathlib.Path.home() / ".password_manager" / "config.json"
 
 def _load_config() -> dict:
     try:
-        return _json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
+        return json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
 def _save_config(cfg: dict) -> None:
     try:
         _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _CONFIG_PATH.write_text(_json.dumps(cfg, indent=2), encoding="utf-8")
+        _CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     except Exception:
         pass
+
+def _get_hotkey_label() -> str:
+    cfg = _load_config()
+    mods = cfg.get("hotkey_modifiers", ["ctrl", "shift"])
+    key  = cfg.get("hotkey_key", "f")
+    try:
+        mod_flags, vk = _autofill.modifiers_vk_from_config(mods, key)
+        return _autofill.hotkey_label(mod_flags, vk)
+    except Exception:
+        return "Ctrl+Shift+F"
 
 # ── Shared hover state (one highlight across all cards AND groups) ─────────────
 _hover_state: dict = {"item": None}
@@ -234,7 +244,6 @@ class _PhoneExportServer:
         threading.Thread(target=self._run, daemon=True, name="phone-export").start()
 
     def _run(self) -> None:
-        import time
         vault  = self._vault
         token  = self._token
         used   = self.used
@@ -331,11 +340,66 @@ class App(ctk.CTk):
     def _start_autofill(self) -> None:
         def _picker(creds, hwnd):
             AppFillDialog(self, creds, hwnd)
+        cfg = _load_config()
+        mods_cfg = cfg.get("hotkey_modifiers", ["ctrl", "shift"])
+        key_cfg  = cfg.get("hotkey_key", "f")
+        try:
+            modifiers, vk = _autofill.modifiers_vk_from_config(mods_cfg, key_cfg)
+        except Exception:
+            modifiers, vk = _autofill.MOD_CONTROL | _autofill.MOD_SHIFT, _autofill.VK_F
         _autofill.start(
             vault_getter=lambda: self.vault,
             tk_root=self,
             show_picker=_picker,
+            modifiers=modifiers,
+            vk=vk,
         )
+
+    def _open_hotkey_dialog(self) -> None:
+        cfg = _load_config()
+        mods_cfg = cfg.get("hotkey_modifiers", ["ctrl", "shift"])
+        key_cfg  = cfg.get("hotkey_key", "f")
+        try:
+            mod_flags, vk = _autofill.modifiers_vk_from_config(mods_cfg, key_cfg)
+        except Exception:
+            mod_flags, vk = _autofill.MOD_CONTROL | _autofill.MOD_SHIFT, _autofill.VK_F
+        current_label = _autofill.hotkey_label(mod_flags, vk)
+
+        _autofill.stop()  # release hotkey so user can press the current combo in the dialog
+
+        def _on_save(new_mod_flags: int, new_vk: int, _label: str) -> None:
+            mod_names: list[str] = []
+            if new_mod_flags & _autofill.MOD_CONTROL: mod_names.append("ctrl")
+            if new_mod_flags & _autofill.MOD_SHIFT:   mod_names.append("shift")
+            if new_mod_flags & _autofill.MOD_ALT:     mod_names.append("alt")
+            key_name = (
+                chr(new_vk).lower() if 0x41 <= new_vk <= 0x5A
+                else f"f{new_vk - 0x6F}" if 0x70 <= new_vk <= 0x7B
+                else "f"
+            )
+            cfg2 = _load_config()
+            cfg2["hotkey_modifiers"] = mod_names
+            cfg2["hotkey_key"] = key_name
+            _save_config(cfg2)
+
+        def _on_dialog_close() -> None:
+            _autofill.wait_stopped()
+            cfg3 = _load_config()
+            mods3 = cfg3.get("hotkey_modifiers", mods_cfg)
+            key3  = cfg3.get("hotkey_key", key_cfg)
+            try:
+                mf3, v3 = _autofill.modifiers_vk_from_config(mods3, key3)
+            except Exception:
+                mf3, v3 = _autofill.MOD_CONTROL | _autofill.MOD_SHIFT, _autofill.VK_F
+            _autofill.start(
+                vault_getter=lambda: self.vault,
+                tk_root=self,
+                show_picker=lambda creds, hwnd: AppFillDialog(self, creds, hwnd),
+                modifiers=mf3,
+                vk=v3,
+            )
+
+        HotkeyDialog(self, current_label, _on_save, on_close=_on_dialog_close)
 
     def _go(self, cls, **kw) -> None:
         if self._frame:
@@ -381,6 +445,7 @@ class App(ctk.CTk):
         if self._tray:
             self._tray.stop()
             self._tray = None
+        _autofill.stop()
         self.after(0, self.destroy)
 
     def _set_window_icon(self) -> None:
@@ -1371,6 +1436,94 @@ class MainFrame(ctk.CTkFrame):
 
 
 
+# ── Shared UI helpers ─────────────────────────────────────────────────────────
+
+def _flash_copy_btn(btn: ctk.CTkButton) -> None:
+    """Briefly show a 'Copied' state on a Copy button, then revert."""
+    try:
+        btn.configure(text="✓  Copied", fg_color=GREEN, text_color="#111827")
+        btn.after(1600, lambda: (
+            btn.configure(text="Copy", fg_color=ACCENT, text_color="#ffffff")
+            if btn.winfo_exists() else None
+        ))
+    except Exception:
+        pass
+
+
+def _bind_hover(widget: ctk.CTkFrame) -> None:
+    """Attach enter/leave highlight behaviour to a card or group widget."""
+    def enter(e):
+        prev = _hover_state["item"]
+        if prev is not None and prev is not widget:
+            try:
+                if prev.winfo_exists():
+                    prev.configure(fg_color=SURFACE, border_color=BORDER)
+            except Exception:
+                pass
+        _hover_state["item"] = widget
+        widget.configure(fg_color=SURFACE_HV, border_color=BORDER_HL)
+
+    def leave(e):
+        try:
+            wx, wy = widget.winfo_rootx(), widget.winfo_rooty()
+            ww, wh = widget.winfo_width(), widget.winfo_height()
+            if not (wx <= e.x_root <= wx + ww and wy <= e.y_root <= wy + wh):
+                widget.configure(fg_color=SURFACE, border_color=BORDER)
+                if _hover_state["item"] is widget:
+                    _hover_state["item"] = None
+        except Exception:
+            pass
+
+    widget.bind("<Enter>", enter, add="+")
+    widget.bind("<Leave>", leave, add="+")
+
+
+def _make_cred_actions(parent, on_edit, on_delete, cred) -> tuple:
+    """Build the Edit/Delete buttons and an unconfigured Copy button; returns (frame, copy_btn)."""
+    acts = ctk.CTkFrame(parent, fg_color="transparent")
+    copy_btn = ctk.CTkButton(
+        acts, text="Copy", width=66, height=32, font=FONT_SM, corner_radius=7,
+        fg_color=ACCENT, hover_color=ACCENT_HV, text_color="#ffffff",
+    )
+    copy_btn.pack(side="left", padx=(0, 5))
+    ctk.CTkButton(
+        acts, text="Edit", width=54, height=32, font=FONT_SM, corner_radius=7,
+        fg_color="transparent", border_width=1, border_color=BORDER,
+        hover_color=SURFACE_HV, text_color=TEXT2,
+        command=lambda: on_edit(cred),
+    ).pack(side="left", padx=(0, 5))
+    ctk.CTkButton(
+        acts, text="✕", width=32, height=32, font=FONT_SM, corner_radius=7,
+        fg_color="transparent", border_width=1, border_color=DANGER,
+        hover_color="#2a0a0a", text_color=DANGER,
+        command=lambda: on_delete(cred),
+    ).pack(side="left")
+    return acts, copy_btn
+
+
+# ── Base dialog ────────────────────────────────────────────────────────────────
+
+class _BaseDialog(ctk.CTkToplevel):
+    """Common scaffolding shared by all modal dialogs."""
+
+    def __init__(self, parent, title: str, size: str | None = None) -> None:
+        super().__init__(parent)
+        self.configure(fg_color=BG)
+        self.title(title)
+        if size is not None:
+            self.geometry(size)
+        self.resizable(False, False)
+        self.transient(parent)
+        self.after(60, lambda: (self.lift(), self.grab_set(), self._center()))
+        self.after(200, lambda: _apply_icon(self))
+
+    def _center(self) -> None:
+        self.update_idletasks()
+        px = self.master.winfo_rootx() + self.master.winfo_width() // 2
+        py = self.master.winfo_rooty() + self.master.winfo_height() // 2
+        self.geometry(f"+{px - self.winfo_width() // 2}+{py - self.winfo_height() // 2}")
+
+
 # ── Credential card (single entry) ────────────────────────────────────────────
 
 class CredentialCard(ctk.CTkFrame):
@@ -1385,7 +1538,6 @@ class CredentialCard(ctk.CTkFrame):
         self._copy_btn       = None
         self._avatar_variant = avatar_variant
         self._build(on_copy, on_edit, on_delete)
-        self._setup_hover()
 
     def _build(self, on_copy, on_edit, on_delete) -> None:
         pad = ctk.CTkFrame(self, fg_color="transparent")
@@ -1405,70 +1557,15 @@ class CredentialCard(ctk.CTkFrame):
         ctk.CTkLabel(info, text=self._cred["username"],
                      font=FONT_SM, text_color=TEXT2, anchor="w").pack(fill="x")
 
-        acts = ctk.CTkFrame(pad, fg_color="transparent")
+        acts, self._copy_btn = _make_cred_actions(pad, on_edit, on_delete, self._cred)
+        self._copy_btn.configure(command=lambda: on_copy(self._cred, self))
         acts.pack(side="right", padx=(10, 0))
 
-        self._copy_btn = ctk.CTkButton(
-            acts, text="Copy", width=66, height=32, font=FONT_SM, corner_radius=7,
-            fg_color=ACCENT, hover_color=ACCENT_HV, text_color="#ffffff",
-            command=lambda: on_copy(self._cred, self),
-        )
-        self._copy_btn.pack(side="left", padx=(0, 5))
-
-        ctk.CTkButton(
-            acts, text="Edit", width=54, height=32, font=FONT_SM, corner_radius=7,
-            fg_color="transparent", border_width=1, border_color=BORDER,
-            hover_color=SURFACE_HV, text_color=TEXT2,
-            command=lambda: on_edit(self._cred),
-        ).pack(side="left", padx=(0, 5))
-
-        ctk.CTkButton(
-            acts, text="✕", width=32, height=32, font=FONT_SM, corner_radius=7,
-            fg_color="transparent", border_width=1, border_color=DANGER,
-            hover_color="#2a0a0a", text_color=DANGER,
-            command=lambda: on_delete(self._cred),
-        ).pack(side="left")
-
-    def _setup_hover(self) -> None:
-        def enter(e):
-            prev = _hover_state["item"]
-            if prev is not None and prev is not self:
-                try:
-                    if prev.winfo_exists():
-                        prev.configure(fg_color=SURFACE, border_color=BORDER)
-                except Exception:
-                    pass
-            _hover_state["item"] = self
-            self.configure(fg_color=SURFACE_HV, border_color=BORDER_HL)
-
-        def leave(e):
-            # Only clear if the cursor genuinely left this widget's bounding box.
-            # This handles the case of moving onto a child widget (button, label)
-            # which would otherwise fire spurious Leave events.
-            try:
-                wx, wy = self.winfo_rootx(), self.winfo_rooty()
-                ww, wh = self.winfo_width(), self.winfo_height()
-                if not (wx <= e.x_root <= wx + ww and wy <= e.y_root <= wy + wh):
-                    self.configure(fg_color=SURFACE, border_color=BORDER)
-                    if _hover_state["item"] is self:
-                        _hover_state["item"] = None
-            except Exception:
-                pass
-
-        self.bind("<Enter>", enter, add="+")
-        self.bind("<Leave>", leave, add="+")
+        _bind_hover(self)
 
     def flash_copied(self) -> None:
-        if not self._copy_btn:
-            return
-        try:
-            self._copy_btn.configure(text="✓  Copied", fg_color=GREEN, text_color="#111827")
-            self._copy_btn.after(1600, lambda: (
-                self._copy_btn.configure(text="Copy", fg_color=ACCENT, text_color="#ffffff")
-                if self._copy_btn.winfo_exists() else None
-            ))
-        except Exception:
-            pass
+        if self._copy_btn:
+            _flash_copy_btn(self._copy_btn)
 
 
 
@@ -1565,7 +1662,7 @@ class CredentialGroup(ctk.CTkFrame):
             except Exception:
                 pass
 
-        self._setup_hover()
+        _bind_hover(self)
 
         # ── Separator + body ──
         self._sep  = ctk.CTkFrame(self, height=1, fg_color=BORDER, corner_radius=0)
@@ -1576,32 +1673,6 @@ class CredentialGroup(ctk.CTkFrame):
             self._body.pack(fill="x")
             self._build_body()
             self._body_built = True
-
-    def _setup_hover(self) -> None:
-        def enter(e):
-            prev = _hover_state["item"]
-            if prev is not None and prev is not self:
-                try:
-                    if prev.winfo_exists():
-                        prev.configure(fg_color=SURFACE, border_color=BORDER)
-                except Exception:
-                    pass
-            _hover_state["item"] = self
-            self.configure(fg_color=SURFACE_HV, border_color=BORDER_HL)
-
-        def leave(e):
-            try:
-                wx, wy = self.winfo_rootx(), self.winfo_rooty()
-                ww, wh = self.winfo_width(), self.winfo_height()
-                if not (wx <= e.x_root <= wx + ww and wy <= e.y_root <= wy + wh):
-                    self.configure(fg_color=SURFACE, border_color=BORDER)
-                    if _hover_state["item"] is self:
-                        _hover_state["item"] = None
-            except Exception:
-                pass
-
-        self.bind("<Enter>", enter, add="+")
-        self.bind("<Leave>", leave, add="+")
 
     def _build_body(self) -> None:
         if not self._creds:
@@ -1629,40 +1700,13 @@ class CredentialGroup(ctk.CTkFrame):
                 info, text=cred["username"], font=FONT, text_color=TEXT, anchor="w",
             ).pack(fill="x")
 
-            acts = ctk.CTkFrame(row, fg_color="transparent")
-            acts.pack(side="right", padx=(0, 14))
-
-            copy_btn = ctk.CTkButton(
-                acts, text="Copy", width=66, height=32, font=FONT_SM, corner_radius=7,
-                fg_color=ACCENT, hover_color=ACCENT_HV, text_color="#ffffff",
-            )
+            acts, copy_btn = _make_cred_actions(row, self._on_edit, self._on_delete, cred)
             copy_btn.configure(command=lambda c=cred, b=copy_btn: self._copy_cred(c, b))
-            copy_btn.pack(side="left", padx=(0, 5))
-
-            ctk.CTkButton(
-                acts, text="Edit", width=54, height=32, font=FONT_SM, corner_radius=7,
-                fg_color="transparent", border_width=1, border_color=BORDER,
-                hover_color=SURFACE_HV, text_color=TEXT2,
-                command=lambda c=cred: self._on_edit(c),
-            ).pack(side="left", padx=(0, 5))
-
-            ctk.CTkButton(
-                acts, text="✕", width=32, height=32, font=FONT_SM, corner_radius=7,
-                fg_color="transparent", border_width=1, border_color=DANGER,
-                hover_color="#2a0a0a", text_color=DANGER,
-                command=lambda c=cred: self._on_delete(c),
-            ).pack(side="left")
+            acts.pack(side="right", padx=(0, 14))
 
     def _copy_cred(self, cred: dict, btn: ctk.CTkButton) -> None:
         self._on_copy(cred, None)
-        try:
-            btn.configure(text="✓  Copied", fg_color=GREEN, text_color="#111827")
-            btn.after(1600, lambda: (
-                btn.configure(text="Copy", fg_color=ACCENT, text_color="#ffffff")
-                if btn.winfo_exists() else None
-            ))
-        except Exception:
-            pass
+        _flash_copy_btn(btn)
 
     def _toggle(self) -> None:
         self._collapsed = not self._collapsed
@@ -1681,27 +1725,23 @@ class CredentialGroup(ctk.CTkFrame):
 
 # ── Add / Edit dialog ─────────────────────────────────────────────────────────
 
-class CredentialDialog(ctk.CTkToplevel):
+class CredentialDialog(_BaseDialog):
     def __init__(self, parent: App, on_save, existing: dict | None = None,
                  existing_groups: list | None = None,
                  preset_group: str = "",
                  custom_tabs: list | None = None,
                  preset_type: str | None = None) -> None:
-        super().__init__(parent)
+        super().__init__(
+            parent,
+            "Edit Credential" if existing else "Add Credential",
+            "460x565" if existing else "460x520",
+        )
         self._on_save         = on_save
         self._existing        = existing
         self._existing_groups = existing_groups or []
         self._preset_group    = preset_group
         self._custom_tabs     = custom_tabs or []
         self._preset_type     = preset_type
-
-        self.configure(fg_color=BG)
-        self.title("Edit Credential" if existing else "Add Credential")
-        self.geometry("460x565" if existing else "460x520")
-        self.resizable(False, False)
-        self.transient(parent)
-        self.after(60, lambda: (self.lift(), self.grab_set(), self._center()))
-        self.after(200, lambda: _apply_icon(self))
         self._build()
 
         if existing:
@@ -1797,7 +1837,7 @@ class CredentialDialog(ctk.CTkToplevel):
         self._app_hint = ctk.CTkLabel(
             body,
             text="Enter the app's window title exactly (e.g. 'Discord', 'Slack').\n"
-                 "Ctrl+Shift+F will autofill when that window is active.",
+                 f"{_get_hotkey_label()} will autofill when that window is active.",
             font=("Segoe UI", 10), text_color=TEXT2,
             wraplength=380, justify="left",
         )
@@ -1960,33 +2000,20 @@ class CredentialDialog(ctk.CTkToplevel):
         })
         self.destroy()
 
-    def _center(self) -> None:
-        self.update_idletasks()
-        px = self.master.winfo_rootx() + self.master.winfo_width()  // 2
-        py = self.master.winfo_rooty() + self.master.winfo_height() // 2
-        self.geometry(f"+{px - self.winfo_width() // 2}+{py - self.winfo_height() // 2}")
-
 
 # ── New-group dialog ──────────────────────────────────────────────────────────
 
-class GroupNameDialog(ctk.CTkToplevel):
+class GroupNameDialog(_BaseDialog):
     """Prompts for a name (group or tab), then hands it back via on_create."""
 
     def __init__(self, parent: App, on_create,
                  title: str = "New Group",
                  header: str = "New Group",
                  placeholder: str = "e.g. Gaming, Work, Social…") -> None:
-        super().__init__(parent)
-        self._on_create  = on_create
-        self._header     = header
+        super().__init__(parent, title, "360x230")
+        self._on_create   = on_create
+        self._header      = header
         self._placeholder = placeholder
-        self.configure(fg_color=BG)
-        self.title(title)
-        self.geometry("360x230")
-        self.resizable(False, False)
-        self.transient(parent)
-        self.after(60, lambda: (self.lift(), self.grab_set(), self._center()))
-        self.after(200, lambda: _apply_icon(self))
         self._build()
 
     def _build(self) -> None:
@@ -2037,25 +2064,12 @@ class GroupNameDialog(ctk.CTkToplevel):
         self._on_create(name)
         self.destroy()
 
-    def _center(self) -> None:
-        self.update_idletasks()
-        px = self.master.winfo_rootx() + self.master.winfo_width()  // 2
-        py = self.master.winfo_rooty() + self.master.winfo_height() // 2
-        self.geometry(f"+{px - self.winfo_width() // 2}+{py - self.winfo_height() // 2}")
-
 
 # ── Password generator dialog ─────────────────────────────────────────────────
 
-class GeneratorDialog(ctk.CTkToplevel):
+class GeneratorDialog(_BaseDialog):
     def __init__(self, parent: App) -> None:
-        super().__init__(parent)
-        self.configure(fg_color=BG)
-        self.title("Password Generator")
-        self.geometry("440x490")
-        self.resizable(False, False)
-        self.transient(parent)
-        self.after(60, lambda: (self.lift(), self.grab_set(), self._center()))
-        self.after(200, lambda: _apply_icon(self))
+        super().__init__(parent, "Password Generator", "440x490")
         self._build()
 
     def _build(self) -> None:
@@ -2174,30 +2188,17 @@ class GeneratorDialog(ctk.CTkToplevel):
             if self._copied_lbl.winfo_exists() else None
         ))
 
-    def _center(self) -> None:
-        self.update_idletasks()
-        px = self.master.winfo_rootx() + self.master.winfo_width()  // 2
-        py = self.master.winfo_rooty() + self.master.winfo_height() // 2
-        self.geometry(f"+{px - self.winfo_width() // 2}+{py - self.winfo_height() // 2}")
-
 
 # ── Autofill picker (multiple matches) ────────────────────────────────────────
 
-class AppFillDialog(ctk.CTkToplevel):
+class AppFillDialog(_BaseDialog):
     """Shown when Ctrl+Shift+F finds multiple credentials for the active app."""
 
     def __init__(self, parent: App, creds: list, hwnd: int) -> None:
-        super().__init__(parent)
+        app_name = creds[0].get("app_name") or creds[0]["domain"]
+        super().__init__(parent, f"Autofill — {app_name}")
         self._creds = creds
         self._hwnd  = hwnd
-
-        app_name = creds[0].get("app_name") or creds[0]["domain"]
-        self.configure(fg_color=BG)
-        self.title(f"Autofill — {app_name}")
-        self.resizable(False, False)
-        self.transient(parent)
-        self.after(60, lambda: (self.lift(), self.grab_set(), self._center()))
-        self.after(200, lambda: _apply_icon(self))
         self._build(app_name)
 
     def _build(self, app_name: str) -> None:
@@ -2248,7 +2249,6 @@ class AppFillDialog(ctk.CTkToplevel):
         self.destroy()
 
         def _fill():
-            import time
             time.sleep(0.3)
             _autofill.focus_hwnd(hwnd)
             time.sleep(0.1)
@@ -2256,32 +2256,17 @@ class AppFillDialog(ctk.CTkToplevel):
 
         threading.Thread(target=_fill, daemon=True).start()
 
-    def _center(self) -> None:
-        self.update_idletasks()
-        px = self.master.winfo_rootx() + self.master.winfo_width()  // 2
-        py = self.master.winfo_rooty() + self.master.winfo_height() // 2
-        self.geometry(f"+{px - self.winfo_width() // 2}+{py - self.winfo_height() // 2}")
-
 
 # ── Send-to-Phone dialog ──────────────────────────────────────────────────────
 
-class SendToPhoneDialog(ctk.CTkToplevel):
+class SendToPhoneDialog(_BaseDialog):
     _TIMEOUT = 60
 
     def __init__(self, parent: App, vault) -> None:
-        super().__init__(parent)
+        super().__init__(parent, "Send to Phone", "320x460")
         self._server: _PhoneExportServer | None = None
         self._seconds = self._TIMEOUT
         self._done    = False
-
-        self.configure(fg_color=BG)
-        self.title("Send to Phone")
-        self.geometry("320x460")
-        self.resizable(False, False)
-        self.transient(parent)
-        self.after(60,  lambda: (self.lift(), self.grab_set(), self._center()))
-        self.after(200, lambda: _apply_icon(self))
-
         self._start_server(vault)
         self._build()
         self.after(1000, self._tick)
@@ -2381,25 +2366,162 @@ class SendToPhoneDialog(ctk.CTkToplevel):
         except Exception:
             pass
 
-    def _center(self) -> None:
-        self.update_idletasks()
-        px = self.master.winfo_rootx() + self.master.winfo_width()  // 2
-        py = self.master.winfo_rooty() + self.master.winfo_height() // 2
-        self.geometry(f"+{px - self.winfo_width() // 2}+{py - self.winfo_height() // 2}")
+
+# ── Hotkey dialog ─────────────────────────────────────────────────────────────
+
+class HotkeyDialog(_BaseDialog):
+    """Captures a new global hotkey combination from a key press event."""
+
+    _CTRL_MASK  = 0x0004
+    _SHIFT_MASK = 0x0001
+    _ALT_MASK   = 0x20000
+
+    _MOD_KEYSYMS = frozenset({
+        "Shift_L", "Shift_R", "Control_L", "Control_R",
+        "Alt_L", "Alt_R", "Caps_Lock", "Super_L", "Super_R",
+        "ISO_Level3_Shift",
+    })
+
+    def __init__(self, parent: App, current_label: str, on_save,
+                 on_close=None) -> None:
+        super().__init__(parent, "Change Autofill Hotkey", "420x310")
+        self._on_save  = on_save
+        self._on_close = on_close
+        self._captured = None  # (mod_flags, vk, label_str)
+        self._closed   = False
+        self.protocol("WM_DELETE_WINDOW", self._do_close)
+        self._build(current_label)
+
+    def _do_close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        cb = self._on_close
+        self._on_close = None
+        self.destroy()
+        if cb:
+            cb()
+
+    def _build(self, current_label: str) -> None:
+        hdr = ctk.CTkFrame(self, height=48, fg_color=HEADER_BG, corner_radius=0)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+        ctk.CTkLabel(hdr, text="Change Autofill Hotkey",
+                     font=FONT_BOLD, text_color=TEXT).pack(side="left", padx=20)
+
+        body = ctk.CTkFrame(self, fg_color=BG)
+        body.pack(fill="both", expand=True, padx=22, pady=14)
+
+        ctk.CTkLabel(
+            body, text=f"Current:  {current_label}",
+            font=FONT_SM, text_color=TEXT2, anchor="w",
+        ).pack(fill="x", pady=(0, 10))
+
+        ctk.CTkLabel(
+            body,
+            text="Click the box below, then press the desired combination.\n"
+                 "Must include Ctrl, Shift, or Alt with a letter (A–Z) or F1–F12.",
+            font=FONT_SM, text_color=TEXT2, anchor="w",
+            justify="left", wraplength=370,
+        ).pack(fill="x", pady=(0, 8))
+
+        self._capture_frame = ctk.CTkFrame(
+            body, fg_color=INPUT_BG, border_width=2,
+            border_color=BORDER, corner_radius=8,
+        )
+        self._capture_frame.pack(fill="x")
+        self._capture_lbl = ctk.CTkLabel(
+            self._capture_frame,
+            text="Click here, then press hotkey…",
+            font=("Consolas", 13), text_color=TEXT2, height=52,
+        )
+        self._capture_lbl.pack(fill="x", padx=14)
+
+        self._err = ctk.CTkLabel(body, text="", text_color=DANGER, font=FONT_SM)
+        self._err.pack(anchor="w", pady=(6, 0))
+
+        btn_row = ctk.CTkFrame(body, fg_color="transparent")
+        btn_row.pack(fill="x", pady=(10, 0))
+        ctk.CTkButton(
+            btn_row, text="Cancel", width=110, height=38, font=FONT,
+            fg_color="transparent", border_width=1, border_color=BORDER,
+            hover_color=SURFACE, text_color=TEXT2,
+            command=self._do_close,
+        ).pack(side="left")
+        self._ok_btn = ctk.CTkButton(
+            btn_row, text="Save", width=110, height=38, font=FONT_BOLD,
+            fg_color=BORDER, hover_color=BORDER, state="disabled",
+            command=self._submit,
+        )
+        self._ok_btn.pack(side="right")
+
+        for w in (self._capture_frame, self._capture_lbl):
+            w.bind("<Button-1>", lambda e: self._activate_capture())
+        self.bind("<KeyPress>", self._on_key)
+
+    def _activate_capture(self) -> None:
+        self._capture_frame.configure(border_color=ACCENT)
+        self._capture_lbl.configure(text="Listening…", text_color=ACCENT)
+        self.focus_set()
+
+    def _on_key(self, event) -> None:
+        if event.keysym in self._MOD_KEYSYMS:
+            return
+
+        mods: list[str] = []
+        mod_flags = 0
+        if event.state & self._CTRL_MASK:
+            mods.append("Ctrl")
+            mod_flags |= _autofill.MOD_CONTROL
+        if event.state & self._SHIFT_MASK:
+            mods.append("Shift")
+            mod_flags |= _autofill.MOD_SHIFT
+        if event.state & self._ALT_MASK:
+            mods.append("Alt")
+            mod_flags |= _autofill.MOD_ALT
+
+        if not mods:
+            self._capture_frame.configure(border_color=DANGER)
+            self._err.configure(
+                text="At least one modifier (Ctrl, Shift, Alt) is required."
+            )
+            return
+
+        ks = event.keysym.upper()
+        vk: int | None = None
+        if len(ks) == 1 and ks.isalpha():
+            vk = ord(ks)
+        elif ks.startswith("F") and ks[1:].isdigit():
+            n = int(ks[1:])
+            if 1 <= n <= 12:
+                vk = 0x6F + n
+
+        if vk is None:
+            self._capture_frame.configure(border_color=DANGER)
+            self._err.configure(
+                text=f"'{event.keysym}' is not supported. Use A–Z or F1–F12."
+            )
+            return
+
+        label = "+".join(mods + [ks])
+        self._captured = (mod_flags, vk, label)
+        self._capture_frame.configure(border_color=GREEN)
+        self._capture_lbl.configure(text=label, text_color=TEXT)
+        self._ok_btn.configure(state="normal", fg_color=ACCENT, hover_color=ACCENT_HV)
+        self._err.configure(text="")
+
+    def _submit(self) -> None:
+        if self._captured:
+            self._on_save(*self._captured)
+        self._do_close()
 
 
 # ── Info dialog ───────────────────────────────────────────────────────────────
 
-class InfoDialog(ctk.CTkToplevel):
+class InfoDialog(_BaseDialog):
     def __init__(self, parent: App) -> None:
-        super().__init__(parent)
-        self.configure(fg_color=BG)
-        self.title("Info")
-        self.geometry("500x660")
-        self.resizable(False, False)
-        self.transient(parent)
-        self.after(60, lambda: (self.lift(), self.grab_set(), self._center()))
-        self.after(200, lambda: _apply_icon(self))
+        super().__init__(parent, "Info", "500x740")
+        self._app = parent
         self._build()
 
     def _build(self) -> None:
@@ -2467,6 +2589,25 @@ class InfoDialog(ctk.CTkToplevel):
             command=self._toggle_tray,
         ).pack(anchor="w", pady=(0, 4))
 
+        # ── Autofill hotkey ───────────────────────────────────────────────────
+        ctk.CTkFrame(body, height=1, fg_color=BORDER).pack(fill="x", pady=(14, 10))
+        ctk.CTkLabel(body, text="Autofill Hotkey", font=FONT_BOLD,
+                     text_color=TEXT, anchor="w").pack(fill="x", pady=(0, 6))
+
+        hk_row = ctk.CTkFrame(body, fg_color=SURFACE, corner_radius=8)
+        hk_row.pack(fill="x", pady=3)
+        hk_inner = ctk.CTkFrame(hk_row, fg_color="transparent")
+        hk_inner.pack(fill="x", padx=12, pady=7)
+        ctk.CTkLabel(
+            hk_inner, text=_get_hotkey_label(),
+            font=("Consolas", 12), text_color=TEXT, anchor="w",
+        ).pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(
+            hk_inner, text="Change", width=70, height=28, font=FONT_SM,
+            fg_color=ACCENT, hover_color=ACCENT_HV,
+            command=self._change_hotkey,
+        ).pack(side="left", padx=(8, 0))
+
         ctk.CTkButton(
             body, text="Close", width=90, height=36, font=FONT,
             fg_color=ACCENT, hover_color=ACCENT_HV,
@@ -2477,6 +2618,10 @@ class InfoDialog(ctk.CTkToplevel):
         cfg = _load_config()
         cfg["start_in_tray"] = self._tray_var.get()
         _save_config(cfg)
+
+    def _change_hotkey(self) -> None:
+        self.destroy()
+        self._app._open_hotkey_dialog()
 
     def _row(self, parent, label: str, value: str,
              copyable: bool = False, open_folder: bool = False) -> None:
@@ -2512,12 +2657,6 @@ class InfoDialog(ctk.CTkToplevel):
                 hover_color=SURFACE_HV, text_color=TEXT2,
                 command=lambda: subprocess.Popen(f'explorer /select,"{value}"', shell=True),
             ).pack(side="left", padx=(8, 0))
-
-    def _center(self) -> None:
-        self.update_idletasks()
-        px = self.master.winfo_rootx() + self.master.winfo_width()  // 2
-        py = self.master.winfo_rooty() + self.master.winfo_height() // 2
-        self.geometry(f"+{px - self.winfo_width() // 2}+{py - self.winfo_height() // 2}")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

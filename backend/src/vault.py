@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import secrets
+import sqlite3
 from urllib.parse import urlparse
 
 from cryptography.fernet import Fernet
@@ -113,10 +115,7 @@ class Vault:
                 "INSERT INTO credentials"
                 " (domain, url, username_enc, password_enc, cred_type, app_name, group_name)"
                 " VALUES (?, ?, ?, ?, 'web', '', ?)",
-                (domain, url,
-                 self._fernet.encrypt(username.encode()).decode(),
-                 self._fernet.encrypt(password.encode()).decode(),
-                 group_name),
+                (domain, url, self._enc(username), self._enc(password), group_name),
             )
             conn.commit()
             return cursor.lastrowid
@@ -130,10 +129,7 @@ class Vault:
                 "INSERT INTO credentials"
                 " (domain, url, username_enc, password_enc, cred_type, app_name, group_name)"
                 " VALUES (?, '', ?, ?, 'app', ?, ?)",
-                (domain,
-                 self._fernet.encrypt(username.encode()).decode(),
-                 self._fernet.encrypt(password.encode()).decode(),
-                 app_name, group_name),
+                (domain, self._enc(username), self._enc(password), app_name, group_name),
             )
             conn.commit()
             return cursor.lastrowid
@@ -191,10 +187,10 @@ class Vault:
         updates, params = [], []
         if username is not None:
             updates.append("username_enc = ?")
-            params.append(self._fernet.encrypt(username.encode()).decode())
+            params.append(self._enc(username))
         if password is not None:
             updates.append("password_enc = ?")
-            params.append(self._fernet.encrypt(password.encode()).decode())
+            params.append(self._enc(password))
         if url is not None:
             updates.append("url = ?")
             params.append(url)
@@ -233,7 +229,6 @@ class Vault:
 
     def get_tab_order(self) -> list[str]:
         """Return full tab order (built-ins + custom). Falls back to default."""
-        import json
         with get_connection() as conn:
             row = conn.execute(
                 "SELECT value FROM vault_meta WHERE key = 'tab_order'"
@@ -258,7 +253,6 @@ class Vault:
         return ["web", "app"] + custom
 
     def set_tab_order(self, order: list[str]) -> None:
-        import json
         with get_connection() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO vault_meta (key, value) VALUES ('tab_order', ?)",
@@ -293,8 +287,6 @@ class Vault:
                 (name,),
             )
             conn.execute("DELETE FROM tabs WHERE name = ?", (name,))
-            # Remove from saved order
-            import json
             row = conn.execute(
                 "SELECT value FROM vault_meta WHERE key = 'tab_order'"
             ).fetchone()
@@ -319,10 +311,7 @@ class Vault:
                 "INSERT INTO credentials"
                 " (domain, url, username_enc, password_enc, cred_type, app_name, group_name)"
                 " VALUES (?, '', ?, ?, ?, ?, ?)",
-                (domain,
-                 self._fernet.encrypt(username.encode()).decode(),
-                 self._fernet.encrypt(password.encode()).decode(),
-                 tab_name, label, group_name),
+                (domain, self._enc(username), self._enc(password), tab_name, label, group_name),
             )
             conn.commit()
             return cursor.lastrowid
@@ -367,6 +356,12 @@ class Vault:
         if not self._fernet:
             raise VaultError("Vault is locked")
 
+    def _enc(self, value: str) -> str:
+        return self._fernet.encrypt(value.encode()).decode()
+
+    def _dec(self, encoded: str) -> str:
+        return self._fernet.decrypt(encoded.encode()).decode()
+
     @staticmethod
     def _derive_key(password: str, salt: bytes) -> bytes:
         kdf = PBKDF2HMAC(
@@ -386,10 +381,8 @@ class Vault:
             "app_name":   row["app_name"]   if "app_name"   in keys else "",
             "cred_type":  row["cred_type"]  if "cred_type"  in keys else "web",
             "group_name": row["group_name"] if "group_name" in keys else "",
-            "username":   self._fernet.decrypt(row["username_enc"].encode()).decode(),
-            "password":   self._fernet.decrypt(row["password_enc"].encode()).decode(),
+            "username":   self._dec(row["username_enc"]),
+            "password":   self._dec(row["password_enc"]),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
-
-

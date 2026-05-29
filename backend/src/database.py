@@ -34,8 +34,7 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_credentials_domain
                 ON credentials(domain);
-        """)
-        conn.executescript("""
+
             CREATE TABLE IF NOT EXISTS groups (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 name       TEXT NOT NULL,
@@ -43,8 +42,7 @@ def init_db() -> None:
                 created_at TEXT DEFAULT (datetime('now')),
                 UNIQUE(name, cred_type)
             );
-        """)
-        conn.executescript("""
+
             CREATE TABLE IF NOT EXISTS tabs (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 name       TEXT NOT NULL UNIQUE,
