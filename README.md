@@ -168,3 +168,22 @@ python startup.py --remove  ← removes it
 ```
 
 The installer handles this automatically via the Windows registry startup key.
+
+# Tech Stack
+Backend (Python)
+- PyQt6 — desktop GUI framework
+- Flask — local REST API server (runs on 127.0.0.1:7412)
+- SQLite — credential storage (~/.password_manager/vault.db)
+- pystray — system tray icon
+- Pillow (PIL) — image generation for the tray icon
+- ctypes / Windows API — global hotkey registration for autofill (RegisterHotKey)
+- PyInstaller — packaging into a standalone .exe (based on the build/ artifacts)
+
+Browser Extension (JavaScript)
+- Manifest V3 Chrome extension
+- Vanilla JS — background.js, content.js, popup.js
+- Communicates with the local Flask API over http://127.0.0.1:7412
+
+Platform
+- Windows only — uses winreg, ctypes.wintypes, and SendInput Win32 APIs
+- Python 3.12 (based on the .pyc filenames)
