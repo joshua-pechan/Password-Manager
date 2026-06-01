@@ -18,11 +18,11 @@ _PATH = Path.home() / ".password_manager" / "device.key"
 
 class _Blob(ctypes.Structure):
     _fields_ = [("cbData", ctypes.wintypes.DWORD),
-                ("pbData", ctypes.POINTER(ctypes.c_byte))]
+                ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
 
 
 def _protect(data: bytes) -> bytes:
-    buf      = (ctypes.c_byte * len(data))(*data)
+    buf      = (ctypes.c_ubyte * len(data))(*data)
     blob_in  = _Blob(len(data), buf)
     blob_out = _Blob()
     if not ctypes.windll.crypt32.CryptProtectData(
@@ -37,7 +37,7 @@ def _protect(data: bytes) -> bytes:
 
 
 def _unprotect(data: bytes) -> bytes:
-    buf      = (ctypes.c_byte * len(data))(*data)
+    buf      = (ctypes.c_ubyte * len(data))(*data)
     blob_in  = _Blob(len(data), buf)
     blob_out = _Blob()
     if not ctypes.windll.crypt32.CryptUnprotectData(

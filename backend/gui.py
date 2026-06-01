@@ -751,9 +751,41 @@ class MainWindow(QMainWindow):
                    f"Delete the database to start fresh:\n{DB_PATH}")
             QTimer.singleShot(0, self.close)
             return
+
+        vault_existed = self.vault.is_initialized()
         try:
             key = _load_key()
-            if not self.vault.is_initialized():
+        except OSError as exc:
+            if "CryptUnprotectData" not in str(exc):
+                _error(self, "Startup Error", str(exc))
+                QTimer.singleShot(0, self.close)
+                return
+            if not vault_existed:
+                # Key encrypted under the wrong DPAPI context, no vault data to lose.
+                # Delete it so load() regenerates it cleanly under the current user.
+                _key_path().unlink(missing_ok=True)
+                try:
+                    key = _load_key()
+                except Exception as exc2:
+                    _error(self, "Startup Error", str(exc2))
+                    QTimer.singleShot(0, self.close)
+                    return
+            else:
+                _error(self, "Device Key Error",
+                       "The device key could not be decrypted.\n\n"
+                       "This can happen after reinstalling Windows or if the vault\n"
+                       "was created under a different user account.\n\n"
+                       "Restore your vault from a JSON backup, or to start fresh delete:\n"
+                       f"  {_key_path()}\n  {DB_PATH}")
+                QTimer.singleShot(0, self.close)
+                return
+        except Exception as exc:
+            _error(self, "Startup Error", str(exc))
+            QTimer.singleShot(0, self.close)
+            return
+
+        try:
+            if not vault_existed:
                 self.vault.setup(key)
             else:
                 self.vault.unlock(key)
@@ -1769,6 +1801,7 @@ class MainWidget(QWidget):
             except Exception:
                 skipped += 1
 
+        self._rebuild_tab_row()
         self._refresh()
         skip_note = (f"\nSkipped {skipped} item{'s' if skipped != 1 else ''} "
                      "(missing required fields).") if skipped else ""
