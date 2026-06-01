@@ -187,3 +187,36 @@ Browser Extension (JavaScript)
 Platform
 - Windows only — uses winreg, ctypes.wintypes, and SendInput Win32 APIs
 - Python 3.12 (based on the .pyc filenames)
+
+# Security Features
+Encryption
+- All usernames and passwords are encrypted at rest using Fernet (AES-128-CBC + HMAC-SHA256) from Python's
+cryptography library — the raw values never touch the database
+- The encryption key is derived from the master password via PBKDF2-HMAC-SHA256 with 600,000 iterations and a 32-byte
+random salt — this matches current NIST recommendations for brute-force resistance
+
+Authentication model
+- Instead of prompting for a password on every launch, the app uses a device key — a secrets.token_urlsafe(48) value
+stored in ~/.password_manager/device.key. This ties the vault to the machine without requiring user interaction
+- The vault won't open if the device key file is missing, and the UI displays a clear error rather than falling back
+silently
+
+API security
+- The local REST API requires an X-Api-Key header on every request matching the device key — unauthenticated requests
+get a 401
+- The API only binds to 127.0.0.1, so it's never reachable over the network
+- The browser extension's manifest.json restricts host_permissions to only http://127.0.0.1:7412/*
+
+Timing-safe comparison
+- unlock() uses secrets.compare_digest() to compare the derived key hash, preventing timing attacks (vault.py:69)
+
+Clipboard auto-clear
+- Copied passwords are automatically cleared from the clipboard after 30 seconds (CLIP_TTL = 30 in gui.py)
+
+Single-instance enforcement
+- single_instance.py prevents multiple concurrent processes, reducing the attack surface from race conditions or
+duplicate API servers
+
+Notable gap worth knowing about: the device key is stored as plaintext on disk — if an attacker has filesystem access,
+both the key and the encrypted database are in the same directory (~/.password_manager/), so physical/OS-level access
+bypasses all encryption.
