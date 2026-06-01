@@ -1,7 +1,7 @@
-"""Desktop GUI for the password manager."""
+"""Desktop GUI for the password manager — PyQt6 edition."""
 from __future__ import annotations
 
-import colorsys
+import csv
 import hashlib
 import http.server
 import io
@@ -14,17 +14,24 @@ import secrets
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import urllib.request
 import winreg
 
 if not getattr(sys, "frozen", False):
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
-import customtkinter as ctk
-import tkinter as tk
-from tkinter import messagebox, filedialog
-import csv
+from PyQt6.QtCore import (Qt, QTimer, QPoint, QRect, QObject,
+                           pyqtSignal, QMimeData)
+from PyQt6.QtGui import (QIcon, QPixmap, QImage, QAction, QCursor, QDrag)
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton,
+    QLineEdit, QVBoxLayout, QHBoxLayout, QScrollArea, QCheckBox, QComboBox,
+    QSlider, QProgressBar, QDialog, QMessageBox, QFileDialog,
+    QSystemTrayIcon, QMenu, QSizePolicy, QAbstractScrollArea,
+)
 
 from vault import Vault, VaultError
 from device_key import load as _load_key, path as _key_path, exists as _key_exists
@@ -33,30 +40,24 @@ import autofill as _autofill
 
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
+try:
+    from version import __version__ as _APP_VERSION
+except ImportError:
+    _APP_VERSION = "0.0.0"
 
-def _apply_icon(window) -> None:
-    """Set the lock icon on any CTk window or Toplevel."""
-    try:
-        import tempfile
-        from PIL import Image
-        if getattr(sys, "frozen", False):
-            icon_src = pathlib.Path(sys._MEIPASS) / "icon128.png"
-        else:
-            icon_src = (
-                pathlib.Path(__file__).parent.parent
-                / "extension" / "icons" / "icon128.png"
-            )
-        ico_path = pathlib.Path(tempfile.gettempdir()) / "pm_icon.ico"
-        if not ico_path.exists():
-            img = Image.open(icon_src)
-            img.save(str(ico_path), format="ICO", sizes=[(32, 32), (48, 48)])
-        window.iconbitmap(str(ico_path))
-    except Exception:
-        pass
+_UPDATE_REPO   = "joshua-pechan/Password-Manager"
+_UPDATE_ASSET  = "PasswordManager_Setup.exe"
 
+from single_instance import acquire as _acquire_lock, send_show_signal as _send_show, start_ipc_listener as _start_ipc
+if not _acquire_lock("gui"):
+    _send_show()
+    sys.exit(0)
+
+CLIP_TTL = 30
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _read_ext_path() -> str:
-    """Return the Chrome extension folder recorded by the installer, or ''."""
     try:
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\PasswordManager")
         val = winreg.QueryValueEx(key, "ExtensionPath")[0]
@@ -64,40 +65,6 @@ def _read_ext_path() -> str:
         return val
     except Exception:
         return ""
-
-from single_instance import acquire as _acquire_lock, send_show_signal as _send_show, start_ipc_listener as _start_ipc
-if not _acquire_lock("gui"):
-    _send_show()
-    sys.exit(0)
-
-ctk.set_appearance_mode("dark")
-ctk.set_default_color_theme("blue")
-
-# ── Design tokens ─────────────────────────────────────────────────────────────
-
-BG         = "#111827"
-HEADER_BG  = "#0a0f1a"
-SURFACE    = "#1f2937"
-SURFACE_HV = "#263445"
-BORDER     = "#374151"
-BORDER_HL  = "#3b82f6"
-INPUT_BG   = "#1a2436"
-ACCENT     = "#3b82f6"
-ACCENT_HV  = "#2563eb"
-DANGER     = "#ef4444"
-DANGER_HV  = "#dc2626"
-TEXT       = "#f9fafb"
-TEXT2      = "#9ca3af"
-GREEN      = "#4ade80"
-SECTION_FG = "#4b5563"   # muted section header text
-
-FONT_SM    = ("Segoe UI", 11)
-FONT       = ("Segoe UI", 12)
-FONT_BOLD  = ("Segoe UI", 13, "bold")
-FONT_TITLE = ("Segoe UI", 17, "bold")
-CLIP_TTL   = 30
-
-# ── App config (start-in-tray, etc.) ─────────────────────────────────────────
 
 _CONFIG_PATH = pathlib.Path.home() / ".password_manager" / "config.json"
 
@@ -124,11 +91,6 @@ def _get_hotkey_label() -> str:
     except Exception:
         return "Ctrl+Shift+F"
 
-# ── Shared hover state (one highlight across all cards AND groups) ─────────────
-_hover_state: dict = {"item": None}
-
-# ── Password generator helpers ────────────────────────────────────────────────
-
 _GEN_UPPER   = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
 _GEN_LOWER   = 'abcdefghijklmnopqrstuvwxyz'
 _GEN_DIGITS  = '0123456789'
@@ -145,141 +107,134 @@ def _gen_password(length: int, upper: bool, lower: bool, digits: bool, symbols: 
     chars = [secrets.choice(pool) for _ in range(length)]
     for i, ch in enumerate(required):
         chars[i] = ch
-    for i in range(len(chars) - 1, 0, -1):          # Fisher-Yates shuffle
+    for i in range(len(chars) - 1, 0, -1):
         j = secrets.randbelow(i + 1)
         chars[i], chars[j] = chars[j], chars[i]
     return ''.join(chars)
 
-def _password_strength(pwd: str) -> tuple[int, str, str]:
-    """Return (0-100 pct, label, hex color) matching the Chrome extension logic."""
+def _password_strength(pwd: str) -> tuple[int, str]:
     if not pwd:
-        return 0, '', '#555555'
+        return 0, ''
     score = 0
     if len(pwd) >= 12: score += 1
     if len(pwd) >= 16: score += 1
     if len(pwd) >= 20: score += 1
-    if re.search(r'[A-Z]',       pwd): score += 1
-    if re.search(r'[a-z]',       pwd): score += 1
-    if re.search(r'[0-9]',       pwd): score += 1
+    if re.search(r'[A-Z]',        pwd): score += 1
+    if re.search(r'[a-z]',        pwd): score += 1
+    if re.search(r'[0-9]',        pwd): score += 1
     if re.search(r'[^A-Za-z0-9]', pwd): score += 1
-    if score <= 2: return 20,  'Weak',        '#ef4444'
-    if score <= 4: return 50,  'Fair',        '#f97316'
-    if score <= 5: return 75,  'Strong',      '#eab308'
-    return              100, 'Very Strong', '#22c55e'
-
+    if score <= 2: return 20,  'Weak'
+    if score <= 4: return 50,  'Fair'
+    if score <= 5: return 75,  'Strong'
+    return              100, 'Very Strong'
 
 def _make_tray_icon():
     from PIL import Image, ImageDraw
     sz = 64
     img = Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
     d   = ImageDraw.Draw(img)
-    d.ellipse([1, 1, sz - 2, sz - 2], fill=(31, 83, 141, 255))
-    bw, bh = int(sz * 0.44), int(sz * 0.32)
-    bx = (sz - bw) // 2
-    by = int(sz * 0.50)
-    d.rounded_rectangle([bx, by, bx + bw, by + bh], radius=3, fill=(255, 255, 255, 255))
-    sw = int(sz * 0.28)
-    sx = (sz - sw) // 2
-    sy = int(sz * 0.20)
-    d.arc([sx, sy, sx + sw, sy + int(sz * 0.38)], start=0, end=180,
-          fill=(255, 255, 255, 255), width=max(3, sz // 11))
+    d.ellipse([1, 1, sz-2, sz-2], fill=(31, 83, 141, 255))
+    bw, bh = int(sz*0.44), int(sz*0.32)
+    bx = (sz-bw)//2
+    by = int(sz*0.50)
+    d.rounded_rectangle([bx, by, bx+bw, by+bh], radius=3, fill=(255,255,255,255))
+    sw = int(sz*0.28)
+    sx = (sz-sw)//2
+    arc_h = int(sz*0.38)
+    sy = by - arc_h // 2
+    d.arc([sx, sy, sx+sw, sy+arc_h], start=180, end=360,
+          fill=(255,255,255,255), width=max(3, sz//11))
     return img
 
-
-_AVATAR_PALETTE = [
-    "#6366f1",  # indigo
-    "#8b5cf6",  # violet
-    "#ec4899",  # pink
-    "#f97316",  # orange
-    "#eab308",  # yellow
-    "#22c55e",  # green
-    "#14b8a6",  # teal
-    "#0ea5e9",  # sky
-]
-
-def _darken_hex(color: str, factor: float) -> str:
-    """Same hue and saturation, value multiplied by factor (HSV)."""
-    h = color.lstrip('#')
-    r, g, b = (int(h[i:i+2], 16) / 255 for i in (0, 2, 4))
-    hue, sat, val = colorsys.rgb_to_hsv(r, g, b)
-    r2, g2, b2 = colorsys.hsv_to_rgb(hue, sat, val * factor)
-    return '#{:02x}{:02x}{:02x}'.format(round(r2 * 255), round(g2 * 255), round(b2 * 255))
-
-def _avatar_color(name: str, variant: int = 0) -> str:
-    idx  = ord(name[0].upper()) % len(_AVATAR_PALETTE) if name else 0
-    base = _AVATAR_PALETTE[idx]
-    return base if variant == 0 else _darken_hex(base, 0.8)
-
-def _initial(name: str) -> str:
-    return (name[0] if name else "?").upper()
+def _app_icon_pixmap() -> QPixmap | None:
+    try:
+        from PIL import Image
+        if getattr(sys, "frozen", False):
+            icon_src = pathlib.Path(sys._MEIPASS) / "icon128.png"
+        else:
+            icon_src = (
+                pathlib.Path(__file__).parent.parent
+                / "extension" / "icons" / "icon128.png"
+            )
+        if not icon_src.exists():
+            return None
+        img = Image.open(str(icon_src)).convert("RGBA")
+        data = img.tobytes("raw", "RGBA")
+        qimg = QImage(data, img.width, img.height, QImage.Format.Format_RGBA8888)
+        return QPixmap.fromImage(qimg)
+    except Exception:
+        return None
 
 
-def _get_local_ip() -> str:
-    """Return the machine's primary LAN IP (works on Ethernet and WiFi)."""
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        try:
-            s.connect(("8.8.8.8", 80))
-            return s.getsockname()[0]
-        except Exception:
-            return "127.0.0.1"
+# ── Cross-thread scheduler ─────────────────────────────────────────────────────
+
+class _Scheduler(QObject):
+    _sig = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self._lock = threading.Lock()
+        self._queue: list = []
+        self._sig.connect(self._drain, Qt.ConnectionType.QueuedConnection)
+
+    def schedule(self, fn):
+        with self._lock:
+            self._queue.append(fn)
+        self._sig.emit()
+
+    def _drain(self):
+        with self._lock:
+            fns, self._queue = list(self._queue), []
+        for f in fns:
+            try:
+                f()
+            except Exception:
+                pass
 
 
-def _find_free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
-
-
-# ── One-time LAN export server ────────────────────────────────────────────────
+# ── Phone export server ────────────────────────────────────────────────────────
 
 class _PhoneExportServer:
-    """Serves a single password CSV over LAN using a one-time token, then shuts down."""
-
     def __init__(self, vault, token: str, port: int) -> None:
         self.used    = threading.Event()
         self._vault  = vault
         self._token  = token
         self._port   = port
-        self._server: http.server.HTTPServer | None = None
+        self._server = None
         threading.Thread(target=self._run, daemon=True, name="phone-export").start()
 
     def _run(self) -> None:
-        vault  = self._vault
-        token  = self._token
-        used   = self.used
+        vault = self._vault; token = self._token; used = self.used
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 if self.path != f"/export/{token}":
-                    self.send_response(404)
-                    self.end_headers()
-                    return
+                    self.send_response(404); self.end_headers(); return
                 creds = vault.get_all()
                 buf   = io.StringIO()
                 w     = csv.writer(buf)
-                w.writerow(["Title", "URL", "Username", "Password", "Notes", "Type"])
+                w.writerow(["Title", "URL", "Username", "Password", "Notes",
+                            "Type", "Group", "Tab"])
                 for c in creds:
-                    title = c.get("app_name") or c["domain"]
-                    w.writerow([title, c["url"], c["username"],
-                                c["password"], "", c.get("cred_type", "web")])
+                    title     = c.get("app_name") or c["domain"]
+                    cred_type = c.get("cred_type", "web")
+                    type_compat = cred_type if cred_type in ("web", "app") else "web"
+                    w.writerow([title, c["url"], c["username"], c["password"], "",
+                                type_compat, c.get("group_name", ""), cred_type])
                 data = buf.getvalue().encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type",        "text/csv; charset=utf-8")
                 self.send_header("Content-Disposition", 'attachment; filename="passwords.csv"')
                 self.send_header("Content-Length",      str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-                self.wfile.flush()
+                self.end_headers(); self.wfile.write(data); self.wfile.flush()
                 used.set()
-
-            def log_message(self, *_):
-                pass
+            def log_message(self, *_): pass
 
         try:
-            srv          = http.server.HTTPServer(("0.0.0.0", self._port), Handler)
-            srv.timeout  = 1
+            srv = http.server.HTTPServer(("0.0.0.0", self._port), Handler)
+            srv.timeout = 1
             self._server = srv
-            deadline     = time.monotonic() + 65
+            deadline = time.monotonic() + 65
             while not used.is_set() and time.monotonic() < deadline:
                 srv.handle_request()
         finally:
@@ -295,31 +250,506 @@ class _PhoneExportServer:
             pass
 
 
-# ── App window ────────────────────────────────────────────────────────────────
+# ── Shared UI helpers ──────────────────────────────────────────────────────────
 
-class App(ctk.CTk):
+def _btn(text: str, parent=None) -> QPushButton:
+    btn = QPushButton(text, parent)
+    btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+    return btn
+
+def _copy_to_clipboard(text: str) -> None:
+    QApplication.clipboard().setText(text)
+
+def _confirm(parent, title: str, msg: str) -> bool:
+    dlg = QMessageBox(parent)
+    dlg.setWindowTitle(title)
+    dlg.setText(msg)
+    dlg.setStandardButtons(
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+    )
+    dlg.setDefaultButton(QMessageBox.StandardButton.No)
+    dlg.setIcon(QMessageBox.Icon.Warning)
+    return dlg.exec() == QMessageBox.StandardButton.Yes
+
+def _error(parent, title: str, msg: str) -> None:
+    dlg = QMessageBox(parent)
+    dlg.setWindowTitle(title)
+    dlg.setText(msg)
+    dlg.setIcon(QMessageBox.Icon.Critical)
+    dlg.exec()
+
+def _info_msg(parent, title: str, msg: str) -> None:
+    dlg = QMessageBox(parent)
+    dlg.setWindowTitle(title)
+    dlg.setText(msg)
+    dlg.setIcon(QMessageBox.Icon.Information)
+    dlg.exec()
+
+def _separator(parent=None, vertical=False) -> QFrame:
+    line = QFrame(parent)
+    line.setFrameShape(QFrame.Shape.VLine if vertical else QFrame.Shape.HLine)
+    line.setFrameShadow(QFrame.Shadow.Sunken)
+    return line
+
+def _get_local_ip() -> str:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        try:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+        except Exception:
+            return "127.0.0.1"
+
+def _find_free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+def _is_newer_version(remote: str, local: str) -> bool:
+    def _parse(v: str):
+        try:
+            return tuple(int(x) for x in v.strip().split("."))
+        except Exception:
+            return (0,)
+    return _parse(remote) > _parse(local)
+
+
+# ── Credential card ────────────────────────────────────────────────────────────
+
+class CredentialCard(QFrame):
+    def __init__(self, parent, cred: dict, on_copy, on_edit, on_delete,
+                 on_select=None, on_drag=None, avatar_variant: int = 0):
+        super().__init__(parent)
+        self._cred       = cred
+        self._on_copy    = on_copy
+        self._on_edit    = on_edit
+        self._on_delete  = on_delete
+        self._on_select  = on_select
+        self._on_drag    = on_drag
+        self._copy_btn: QPushButton | None = None
+        self._selected        = False
+        self._drag_start:     QPoint | None = None
+        self._pending_deselect = False
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setObjectName("credential_card")
+        self._build()
+
+    def _build(self) -> None:
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(14, 11, 14, 11)
+        outer.setSpacing(14)
+
+        label = self._cred.get("app_name") or self._cred["domain"]
+
+        info = QVBoxLayout()
+        info.setSpacing(2)
+        info.setContentsMargins(0, 0, 0, 0)
+        name_lbl = QLabel(label)
+        name_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        user_lbl = QLabel(self._cred["username"])
+        user_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        info.addWidget(name_lbl)
+        info.addWidget(user_lbl)
+        outer.addLayout(info, 1)
+
+        acts = QHBoxLayout()
+        acts.setSpacing(5)
+        acts.setContentsMargins(0, 0, 0, 0)
+
+        self._copy_btn = _btn("Copy")
+        self._copy_btn.clicked.connect(self._do_copy)
+        acts.addWidget(self._copy_btn)
+
+        edit_btn = _btn("Edit")
+        edit_btn.clicked.connect(lambda: self._on_edit(self._cred))
+        acts.addWidget(edit_btn)
+
+        del_btn = _btn("Delete")
+        del_btn.clicked.connect(lambda: self._on_delete(self._cred))
+        acts.addWidget(del_btn)
+
+        outer.addLayout(acts)
+
+    def set_selected(self, selected: bool) -> None:
+        self._selected = selected
+        if selected:
+            self.setStyleSheet(
+                "QFrame#credential_card { background-color: #cce4f7; }"
+                " QFrame#credential_card QLabel { color: #1a1a1a; }"
+                " QFrame#credential_card QPushButton { color: #1a1a1a; }"
+            )
+        else:
+            self.setStyleSheet("")
+        self.update()
+
+    def leaveEvent(self, event) -> None:
+        super().leaveEvent(event)
+        if self._selected:
+            self.update()
+
+    def _do_copy(self) -> None:
+        self._on_copy(self._cred, self)
+
+    def flash_copied(self) -> None:
+        if self._copy_btn:
+            self._copy_btn.setText("Copied")
+            QTimer.singleShot(1600, self._revert_copy)
+
+    def _revert_copy(self) -> None:
+        if self._copy_btn:
+            self._copy_btn.setText("Copy")
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start = event.pos()
+            has_mod = bool(event.modifiers() & (
+                Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier
+            ))
+            if self._selected and not has_mod:
+                # Defer deselection: user may be about to drag the whole selection.
+                # Apply it on release only if no drag occurred.
+                self._pending_deselect = True
+            else:
+                self._pending_deselect = False
+                if self._on_select:
+                    self._on_select(self, event.modifiers())
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._pending_deselect:
+            self._pending_deselect = False
+            if self._on_select:
+                self._on_select(self, event.modifiers())
+        self._pending_deselect = False
+        self._drag_start = None
+        super().mouseReleaseEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if (self._drag_start is not None
+                and event.buttons() & Qt.MouseButton.LeftButton
+                and (event.pos() - self._drag_start).manhattanLength() > 8):
+            self._drag_start = None
+            self._pending_deselect = False  # drag wins; keep the full selection
+            if self._on_drag:
+                self._on_drag(self)
+        super().mouseMoveEvent(event)
+
+
+# ── Credential group ───────────────────────────────────────────────────────────
+
+class CredentialGroup(QFrame):
+    def __init__(self, parent, display_name: str, group_key: str, creds: list,
+                 collapsed: bool, on_toggle, on_copy, on_edit, on_delete,
+                 avatar_variant: int = 0, on_register_drop=None,
+                 is_manual: bool = False, on_delete_group=None,
+                 on_drop=None):
+        super().__init__(parent)
+        self._display      = display_name
+        self._key          = group_key
+        self._creds        = creds
+        self._collapsed    = collapsed
+        self._on_toggle    = on_toggle
+        self._on_copy      = on_copy
+        self._on_edit      = on_edit
+        self._on_delete    = on_delete
+        self._on_reg_drop  = on_register_drop
+        self._is_manual    = is_manual
+        self._on_del_group = on_delete_group
+        self._on_drop      = on_drop
+        self._body_built   = False
+        self._body_widget: QWidget | None = None
+        self._sep_widget:  QFrame  | None = None
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setObjectName("credential_group")
+        self.setAcceptDrops(True)
+        self._outer = QVBoxLayout(self)
+        self._outer.setContentsMargins(0, 0, 0, 0)
+        self._outer.setSpacing(0)
+        self._build_header()
+        if not self._collapsed:
+            self._show_body()
+        if self._on_reg_drop:
+            QTimer.singleShot(150, lambda: self._on_reg_drop(self._key, self))
+
+    def _build_header(self) -> None:
+        hdr = QWidget()
+        hdr_layout = QHBoxLayout(hdr)
+        hdr_layout.setContentsMargins(14, 10, 14, 10)
+        hdr_layout.setSpacing(14)
+
+        info = QVBoxLayout()
+        info.setSpacing(2)
+        info.setContentsMargins(0, 0, 0, 0)
+        info.addWidget(QLabel(self._display))
+        n = len(self._creds)
+        count_text = "Empty — drag a login here" if n == 0 else f"{n} login{'s' if n != 1 else ''}"
+        info.addWidget(QLabel(count_text))
+        hdr_layout.addLayout(info, 1)
+
+        if self._is_manual and self._on_del_group:
+            db = _btn("Delete Group")
+            db.clicked.connect(lambda: self._on_del_group(self._key))
+            hdr_layout.addWidget(db)
+
+        self._chevron = _btn("▲" if not self._collapsed else "▼")
+        self._chevron.clicked.connect(self._toggle)
+        hdr_layout.addWidget(self._chevron)
+
+        hdr.setObjectName("group_header")
+        hdr.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._outer.addWidget(hdr)
+        self._hdr_widget = hdr
+        hdr.mousePressEvent = lambda e: self._toggle()
+
+    def _toggle(self) -> None:
+        self._collapsed = not self._collapsed
+        self._chevron.setText("▼" if self._collapsed else "▲")
+        self._on_toggle(self._key, self._collapsed)
+        if self._collapsed:
+            if self._sep_widget:
+                self._sep_widget.hide()
+            if self._body_widget:
+                self._body_widget.hide()
+        else:
+            self._show_body()
+
+    def _show_body(self) -> None:
+        if not self._body_built:
+            self._sep_widget = _separator(self)
+            self._outer.addWidget(self._sep_widget)
+            self._body_widget = QWidget()
+            self._body_layout = QVBoxLayout(self._body_widget)
+            self._body_layout.setContentsMargins(0, 0, 0, 0)
+            self._body_layout.setSpacing(0)
+            self._build_body()
+            self._outer.addWidget(self._body_widget)
+            self._body_built = True
+        else:
+            if self._sep_widget:
+                self._sep_widget.show()
+            if self._body_widget:
+                self._body_widget.show()
+
+    def _build_body(self) -> None:
+        if not self._creds:
+            lbl = QLabel("Drag a credential here to add it to this group")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setContentsMargins(0, 16, 0, 16)
+            self._body_layout.addWidget(lbl)
+            return
+        for i, cred in enumerate(self._creds):
+            row = QWidget()
+            row.setProperty("drag_cred", cred)
+            row._drag_start = None
+
+            def _make_press(r):
+                def _press(e):
+                    if e.button() == Qt.MouseButton.LeftButton:
+                        r._drag_start = e.pos()
+                return _press
+
+            def _make_move(r, c):
+                def _move(e):
+                    if (r._drag_start is not None
+                            and e.buttons() & Qt.MouseButton.LeftButton
+                            and (e.pos() - r._drag_start).manhattanLength() > 8):
+                        r._drag_start = None
+                        # Use _list_widget (self.parent()) as QDrag parent so Qt
+                        # can't delete the QDrag via the short-lived row widget
+                        # if processEvents() fires inside drag.exec().
+                        drag = QDrag(self.parent() or self)
+                        mime = QMimeData()
+                        mime.setData("application/x-credential-ids",
+                                     json.dumps([c["id"]]).encode("utf-8"))
+                        drag.setMimeData(mime)
+                        drag.exec(Qt.DropAction.MoveAction)
+                        drag.deleteLater()
+                return _move
+
+            row.mousePressEvent = _make_press(row)
+            row.mouseMoveEvent  = _make_move(row, cred)
+
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(14, 6 if i > 0 else 10, 14, 6)
+            rl.setSpacing(10)
+            label = cred.get("app_name") or cred["domain"]
+            info_lbl = QLabel(f"{label}  –  {cred['username']}")
+            info_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            rl.addWidget(info_lbl, 1)
+
+            acts = QHBoxLayout()
+            acts.setSpacing(5)
+            acts.setContentsMargins(0, 0, 0, 0)
+            copy_btn = _btn("Copy")
+
+            def _make_copy(c, b):
+                def _do():
+                    self._on_copy(c, None)
+                    b.setText("Copied")
+                    QTimer.singleShot(1600, lambda: b.setText("Copy"))
+                return _do
+
+            copy_btn.clicked.connect(_make_copy(cred, copy_btn))
+            acts.addWidget(copy_btn)
+
+            edit_btn = _btn("Edit")
+            edit_btn.clicked.connect(lambda _, c=cred: self._on_edit(c))
+            acts.addWidget(edit_btn)
+
+            del_btn = _btn("Delete")
+            del_btn.clicked.connect(lambda _, c=cred: self._on_delete(c))
+            acts.addWidget(del_btn)
+
+            rl.addLayout(acts)
+            self._body_layout.addWidget(row)
+        self._body_layout.addSpacing(4)
+
+    def get_drop_rect(self) -> QRect:
+        return self._hdr_widget.rect().translated(
+            self._hdr_widget.mapToGlobal(QPoint(0, 0))
+        )
+
+    def dragEnterEvent(self, event) -> None:
+        if event.mimeData().hasFormat("application/x-credential-ids"):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:
+        if event.mimeData().hasFormat("application/x-credential-ids"):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:
+        if event.mimeData().hasFormat("application/x-credential-ids") and self._on_drop:
+            data = bytes(event.mimeData().data("application/x-credential-ids"))
+            cred_ids = json.loads(data.decode("utf-8"))
+            self._on_drop(self._key, cred_ids)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+
+# ── Tab button ─────────────────────────────────────────────────────────────────
+
+class TabButton(QWidget):
+    clicked = pyqtSignal(str)
+    remove_requested = pyqtSignal(str)
+
+    def __init__(self, key: str, label: str, is_active: bool,
+                 is_custom: bool, parent=None):
+        super().__init__(parent)
+        self._key       = key
+        self._active    = is_active
+        self._is_custom = is_custom
+        self.setFixedHeight(44)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._drag_start_pos: QPoint | None = None
+        self._build(label)
+
+    def _build(self, label: str) -> None:
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 0, 12, 0)
+        layout.setSpacing(6)
+
+        self._lbl = QLabel(label)
+        self._lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._lbl, 1)
+
+        if self._is_custom:
+            x_btn = QPushButton("×")
+            x_btn.setFixedSize(18, 18)
+            x_btn.setFlat(True)
+            x_btn.setStyleSheet("padding: 0;")
+            x_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            x_btn.clicked.connect(lambda: self.remove_requested.emit(self._key))
+            layout.addWidget(x_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+
+    def set_active(self, active: bool) -> None:
+        self._active = active
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start_pos = event.pos()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self._key)
+        self._drag_start_pos = None
+
+    def mouseMoveEvent(self, event):
+        if (self._drag_start_pos is not None and
+                event.buttons() & Qt.MouseButton.LeftButton):
+            if (event.pos() - self._drag_start_pos).manhattanLength() > 6:
+                drag = QDrag(self)
+                mime = QMimeData()
+                mime.setText(self._key)
+                drag.setMimeData(mime)
+                drag.exec(Qt.DropAction.MoveAction)
+                self._drag_start_pos = None
+
+
+# ── Drop-target list widget ────────────────────────────────────────────────────
+
+class _DropTarget(QWidget):
+    """Main list widget that accepts drops to remove credentials from groups."""
+
+    def __init__(self, on_drop, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self._on_drop = on_drop
+
+    def dragEnterEvent(self, event) -> None:
+        if event.mimeData().hasFormat("application/x-credential-ids"):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:
+        if event.mimeData().hasFormat("application/x-credential-ids"):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:
+        if event.mimeData().hasFormat("application/x-credential-ids"):
+            data = bytes(event.mimeData().data("application/x-credential-ids"))
+            cred_ids = json.loads(data.decode("utf-8"))
+            self._on_drop(cred_ids)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+
+# ── Main window ────────────────────────────────────────────────────────────────
+
+class MainWindow(QMainWindow):
+    _show_picker_sig = pyqtSignal(list, int)
+
     def __init__(self) -> None:
         super().__init__()
-        self.configure(fg_color=BG)
-        self.vault = Vault()
-        self.title("Password Manager")
-        self.after(200, self._set_window_icon)
-        self.geometry("920x660")
-        self.minsize(680, 460)
-        self._frame: ctk.CTkFrame | None = None
-        self._tray  = None
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
-        _start_ipc(lambda: self.after(0, self._do_restore))
+        self.vault      = Vault()
+        self._tray      = None
+        self._clip_timer: QTimer | None = None
+        self._scheduler = _Scheduler()
+        self.setWindowTitle("Password Manager")
+        self.resize(920, 660)
+        self.setMinimumSize(680, 460)
+        icon = _app_icon_pixmap()
+        if icon:
+            self.setWindowIcon(QIcon(icon))
+            QApplication.instance().setWindowIcon(QIcon(icon))
+        self._show_picker_sig.connect(self._on_show_picker)
+        _start_ipc(lambda: self._scheduler.schedule(self._do_restore))
         self._auto_unlock()
 
     def _auto_unlock(self) -> None:
         if not _key_exists() and self.vault.is_initialized():
-            messagebox.showerror(
-                "Vault Inaccessible",
-                f"Device key missing:\n{_key_path()}\n\n"
-                f"Delete the database to start fresh:\n{DB_PATH}",
-            )
-            self.destroy()
+            _error(self, "Vault Inaccessible",
+                   f"Device key missing:\n{_key_path()}\n\n"
+                   f"Delete the database to start fresh:\n{DB_PATH}")
+            QTimer.singleShot(0, self.close)
             return
         try:
             key = _load_key()
@@ -328,18 +758,19 @@ class App(ctk.CTk):
             else:
                 self.vault.unlock(key)
         except Exception as exc:
-            messagebox.showerror("Startup Error", str(exc))
-            self.destroy()
+            _error(self, "Startup Error", str(exc))
+            QTimer.singleShot(0, self.close)
             return
+
         self._start_server()
-        self._go(MainFrame)
+        self._main = MainWidget(self)
+        self.setCentralWidget(self._main)
         self._start_autofill()
         if _load_config().get("start_in_tray"):
-            self.after(300, self._on_close)
+            QTimer.singleShot(300, self._on_close)
+        QTimer.singleShot(5000, self._check_for_update)
 
     def _start_autofill(self) -> None:
-        def _picker(creds, hwnd):
-            AppFillDialog(self, creds, hwnd)
         cfg = _load_config()
         mods_cfg = cfg.get("hotkey_modifiers", ["ctrl", "shift"])
         key_cfg  = cfg.get("hotkey_key", "f")
@@ -349,11 +780,14 @@ class App(ctk.CTk):
             modifiers, vk = _autofill.MOD_CONTROL | _autofill.MOD_SHIFT, _autofill.VK_F
         _autofill.start(
             vault_getter=lambda: self.vault,
-            tk_root=self,
-            show_picker=_picker,
+            show_picker=lambda creds, hwnd: self._show_picker_sig.emit(creds, hwnd),
             modifiers=modifiers,
             vk=vk,
+            schedule_fn=self._scheduler.schedule,
         )
+
+    def _on_show_picker(self, creds: list, hwnd: int) -> None:
+        AppFillDialog(self, creds, hwnd).exec()
 
     def _open_hotkey_dialog(self) -> None:
         cfg = _load_config()
@@ -364,11 +798,10 @@ class App(ctk.CTk):
         except Exception:
             mod_flags, vk = _autofill.MOD_CONTROL | _autofill.MOD_SHIFT, _autofill.VK_F
         current_label = _autofill.hotkey_label(mod_flags, vk)
+        _autofill.stop()
 
-        _autofill.stop()  # release hotkey so user can press the current combo in the dialog
-
-        def _on_save(new_mod_flags: int, new_vk: int, _label: str) -> None:
-            mod_names: list[str] = []
+        def _on_save(new_mod_flags, new_vk, _lbl):
+            mod_names = []
             if new_mod_flags & _autofill.MOD_CONTROL: mod_names.append("ctrl")
             if new_mod_flags & _autofill.MOD_SHIFT:   mod_names.append("shift")
             if new_mod_flags & _autofill.MOD_ALT:     mod_names.append("alt")
@@ -382,30 +815,25 @@ class App(ctk.CTk):
             cfg2["hotkey_key"] = key_name
             _save_config(cfg2)
 
-        def _on_dialog_close() -> None:
+        def _on_closed():
             _autofill.wait_stopped()
             cfg3 = _load_config()
-            mods3 = cfg3.get("hotkey_modifiers", mods_cfg)
-            key3  = cfg3.get("hotkey_key", key_cfg)
+            m3   = cfg3.get("hotkey_modifiers", mods_cfg)
+            k3   = cfg3.get("hotkey_key", key_cfg)
             try:
-                mf3, v3 = _autofill.modifiers_vk_from_config(mods3, key3)
+                mf3, v3 = _autofill.modifiers_vk_from_config(m3, k3)
             except Exception:
                 mf3, v3 = _autofill.MOD_CONTROL | _autofill.MOD_SHIFT, _autofill.VK_F
             _autofill.start(
                 vault_getter=lambda: self.vault,
-                tk_root=self,
-                show_picker=lambda creds, hwnd: AppFillDialog(self, creds, hwnd),
-                modifiers=mf3,
-                vk=v3,
+                show_picker=lambda creds, hwnd: self._show_picker_sig.emit(creds, hwnd),
+                modifiers=mf3, vk=v3,
+                schedule_fn=self._scheduler.schedule,
             )
 
-        HotkeyDialog(self, current_label, _on_save, on_close=_on_dialog_close)
-
-    def _go(self, cls, **kw) -> None:
-        if self._frame:
-            self._frame.destroy()
-        self._frame = cls(self, **kw)
-        self._frame.pack(fill="both", expand=True)
+        dlg = HotkeyDialog(self, current_label, _on_save)
+        dlg.finished.connect(lambda _: _on_closed())
+        dlg.exec()
 
     def _start_server(self) -> None:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -414,8 +842,12 @@ class App(ctk.CTk):
         import server as srv
         threading.Thread(target=srv.run, daemon=True, name="api").start()
 
+    def closeEvent(self, event) -> None:
+        event.ignore()
+        self._on_close()
+
     def _on_close(self) -> None:
-        self.withdraw()
+        self.hide()
         if self._tray is not None:
             return
         try:
@@ -428,447 +860,281 @@ class App(ctk.CTk):
             self._tray = pystray.Icon("pwmgr", _make_tray_icon(), "Password Manager", menu)
             threading.Thread(target=self._tray.run, daemon=True, name="tray").start()
         except Exception:
-            self.destroy()
+            QApplication.instance().quit()
 
     def _restore_window(self, icon=None, item=None) -> None:
-        self.after(0, self._do_restore)
+        self._scheduler.schedule(self._do_restore)
 
     def _do_restore(self) -> None:
         if self._tray:
             self._tray.stop()
             self._tray = None
-        self.deiconify()
-        self.lift()
-        self.focus_force()
+        self.show()
+        self.raise_()
+        self.activateWindow()
 
     def _quit_from_tray(self, icon=None, item=None) -> None:
         if self._tray:
             self._tray.stop()
             self._tray = None
         _autofill.stop()
-        self.after(0, self.destroy)
+        self._scheduler.schedule(lambda: QApplication.instance().quit())
 
-    def _set_window_icon(self) -> None:
-        _apply_icon(self)
+    def copy_password(self, cred: dict, card=None) -> None:
+        if self._clip_timer:
+            self._clip_timer.stop()
+        _copy_to_clipboard(cred["password"])
+        if card is not None:
+            card.flash_copied()
+        self._clip_timer = QTimer(self)
+        self._clip_timer.setSingleShot(True)
+        self._clip_timer.timeout.connect(lambda: QApplication.clipboard().clear())
+        self._clip_timer.start(CLIP_TTL * 1000)
+
+    def _check_for_update(self) -> None:
+        threading.Thread(target=self._update_worker, daemon=True,
+                         name="update-check").start()
+
+    def _update_worker(self) -> None:
+        try:
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/{_UPDATE_REPO}/releases/latest",
+                headers={"User-Agent": "PasswordManager-UpdateCheck"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+            tag = data.get("tag_name", "").lstrip("v")
+            if not tag or not _is_newer_version(tag, _APP_VERSION):
+                return
+            assets = data.get("assets", [])
+            dl_url = next(
+                (a["browser_download_url"] for a in assets
+                 if a["name"] == _UPDATE_ASSET),
+                None,
+            )
+            if dl_url:
+                self._scheduler.schedule(
+                    lambda t=tag, u=dl_url: self._on_update_available(t, u)
+                )
+        except Exception:
+            pass
+
+    def _on_update_available(self, tag: str, url: str) -> None:
+        UpdateDialog(self, tag, url).show()
 
 
-# ── Main view ─────────────────────────────────────────────────────────────────
+# ── Main widget ────────────────────────────────────────────────────────────────
 
-class MainFrame(ctk.CTkFrame):
-    def __init__(self, parent: App, **kw) -> None:
-        super().__init__(parent, fg_color=BG, **kw)
-        self._app = parent
-        self._clip_timer: threading.Timer | None = None
-        self._db_hash: str = self._get_db_hash()
-        self._collapsed: dict[str, bool] = {}   # group_key → collapsed state
-        self._group_keys: list[str] = []         # keys of current multi-cred groups
-        self._active_tab: str = "web"
-        self._tab_btns: dict[str, tuple] = {}
-        self._tab_order: list[str] = []
+class MainWidget(QWidget):
+    BUILTIN_LABELS = {"web": "Websites", "app": "Apps"}
+
+    def __init__(self, win: MainWindow) -> None:
+        super().__init__(win)
+        self._win          = win
+        self._active_tab   = "web"
+        self._tab_order:   list[str] = []
         self._custom_tabs: list[str] = []
-        self._tab_w: int = 140
-        # tab drag-to-reorder state
-        self._drag_tab_key: str | None = None
-        self._drag_tab_ghost: tk.Frame | None = None
-        self._drag_tab_press_xy: tuple | None = None
-        self._drag_tab_active: bool = False
-        self._drop_zones: list  = []             # (group_key, header_widget) for drag-to-group
-        self._drag_label: tk.Frame | None = None
-        self._drag_cred: dict | None = None
-        self._drag_press_xy: tuple | None = None
-        self._drag_active: bool = False
+        self._collapsed:   dict[str, bool] = {}
+        self._group_keys:  list[str] = []
+        self._drop_zones:  list      = []
+        self._tab_btns:    dict[str, TabButton] = {}
+        self._drag_label:  QWidget | None = None
+        self._drag_cred:   dict | None = None
+        self._drag_active  = False
+        self._drag_press_xy: QPoint | None = None
+        self._db_hash      = ""
+        self._selected_cards: list = []
+        self._all_cards:      list = []
+        self._anchor_card          = None
 
-        self._build_header()
-        self._build_search()
-        self._build_tabs()
-        self._build_list()
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._build_header(outer)
+        self._build_search(outer)
+        self._build_tabs(outer)
+        self._build_list(outer)
+
+        self._db_hash = self._get_db_hash()
         self._refresh()
 
-        parent.bind("<ButtonPress-1>",   self._on_global_press,   add="+")
-        parent.bind("<B1-Motion>",        self._on_global_motion,  add="+")
-        parent.bind("<ButtonRelease-1>",  self._on_global_release, add="+")
+        self._poll_timer = QTimer(self)
+        self._poll_timer.timeout.connect(self._poll_db)
+        self._poll_timer.start(2000)
 
-        parent.bind_all("<Control-n>", lambda _: self._open_add())
-        parent.bind_all("<Control-f>", lambda _: self._search_entry.focus_set())
-        parent.bind_all("<Escape>",    lambda _: self._search_var.set(""))
+    # ── Header ─────────────────────────────────────────────────────────────────
 
-        self.after(2000, self._poll_db)
+    def _build_header(self, outer: QVBoxLayout) -> None:
+        hdr = QWidget()
+        hl = QHBoxLayout(hdr)
+        hl.setContentsMargins(20, 8, 16, 8)
+        hl.setSpacing(4)
 
-    # ── Header ────────────────────────────────────────────────────────────────
+        hl.addWidget(QLabel("Password Manager"))
+        hl.addStretch(1)
 
-    def _build_header(self) -> None:
-        hdr = ctk.CTkFrame(self, height=62, fg_color=HEADER_BG, corner_radius=0)
-        hdr.pack(fill="x")
-        hdr.pack_propagate(False)
+        self._count_lbl = QLabel("")
+        hl.addWidget(self._count_lbl)
 
-        ctk.CTkLabel(
-            hdr, text="Password Manager",
-            font=FONT_TITLE, text_color=TEXT,
-        ).pack(side="left", padx=20)
+        add_btn = _btn("+ Add")
+        add_btn.clicked.connect(self._open_add)
+        hl.addWidget(add_btn)
 
-        ctk.CTkButton(
-            hdr, text="Info", width=68, height=34, font=FONT_SM,
-            fg_color="transparent", border_width=1, border_color=BORDER,
-            hover_color=SURFACE, text_color=TEXT2,
-            command=self._show_info,
-        ).pack(side="right", padx=(4, 16), pady=14)
+        grp_btn = _btn("+ Group")
+        grp_btn.clicked.connect(self._open_new_group)
+        hl.addWidget(grp_btn)
 
-        self._transfer_btn = ctk.CTkButton(
-            hdr, text="Transfer ▾", width=106, height=34, font=FONT_SM,
-            fg_color="transparent", border_width=1, border_color=BORDER,
-            hover_color=SURFACE, text_color=TEXT2,
-            command=self._show_transfer_menu,
-        )
-        self._transfer_btn.pack(side="right", padx=(4, 0), pady=14)
+        gen_btn = _btn("Generator")
+        gen_btn.clicked.connect(self._open_generator)
+        hl.addWidget(gen_btn)
 
-        ctk.CTkButton(
-            hdr, text="Generator", width=100, height=34, font=FONT_SM,
-            fg_color="transparent", border_width=1, border_color=BORDER,
-            hover_color=SURFACE, text_color=TEXT2,
-            command=self._open_generator,
-        ).pack(side="right", padx=4, pady=14)
+        self._transfer_btn = _btn("Transfer")
+        self._transfer_btn.clicked.connect(self._show_transfer_menu)
+        hl.addWidget(self._transfer_btn)
 
-        ctk.CTkButton(
-            hdr, text="+ Group", width=90, height=34, font=FONT,
-            fg_color="transparent", border_width=1, border_color=BORDER,
-            hover_color=SURFACE, text_color=TEXT2, corner_radius=8,
-            command=self._open_new_group,
-        ).pack(side="right", padx=4, pady=14)
+        info_btn = _btn("Info")
+        info_btn.clicked.connect(self._show_info)
+        hl.addWidget(info_btn)
 
-        ctk.CTkButton(
-            hdr, text="+ Add", width=90, height=34, font=FONT_BOLD,
-            fg_color=ACCENT, hover_color=ACCENT_HV, corner_radius=8,
-            command=self._open_add,
-        ).pack(side="right", padx=(0, 4), pady=14)
+        outer.addWidget(hdr)
+        outer.addWidget(_separator())
 
-        self._count_lbl = ctk.CTkLabel(hdr, text="", font=FONT_SM, text_color=TEXT2)
-        self._count_lbl.pack(side="right", padx=12)
+    # ── Search ──────────────────────────────────────────────────────────────────
 
-    # ── Search bar ────────────────────────────────────────────────────────────
+    def _build_search(self, outer: QVBoxLayout) -> None:
+        bar = QWidget()
+        bl = QHBoxLayout(bar)
+        bl.setContentsMargins(16, 8, 16, 8)
+        bl.setSpacing(8)
 
-    def _build_search(self) -> None:
-        bar = ctk.CTkFrame(self, fg_color=HEADER_BG, corner_radius=0)
-        bar.pack(fill="x")
-        ctk.CTkFrame(bar, height=1, fg_color=BORDER, corner_radius=0).pack(fill="x")
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search by site, app, username, or URL…")
+        self._search.textChanged.connect(lambda _: self._refresh())
+        bl.addWidget(self._search, 1)
 
-        search_row = ctk.CTkFrame(bar, fg_color="transparent")
-        search_row.pack(fill="x", padx=16, pady=10)
+        self._collapse_btn = _btn("Expand All")
+        self._collapse_btn.clicked.connect(self._toggle_all_groups)
+        bl.addWidget(self._collapse_btn)
 
-        self._search_var = tk.StringVar()
-        self._search_var.trace_add("write", lambda *_: self._refresh())
+        outer.addWidget(bar)
+        outer.addWidget(_separator())
 
-        self._search_entry = ctk.CTkEntry(
-            search_row,
-            textvariable=self._search_var,
-            placeholder_text="🔍   Search by site, app, username, or URL…",
-            height=38, font=FONT,
-            fg_color=INPUT_BG, border_color=BORDER,
-            border_width=1, corner_radius=8, text_color=TEXT,
-        )
-        self._search_entry.pack(side="left", fill="x", expand=True)
+    # ── Tab bar ─────────────────────────────────────────────────────────────────
 
-        self._collapse_btn = ctk.CTkButton(
-            search_row, text="Expand All", width=106, height=38, font=FONT_SM,
-            fg_color="transparent", border_width=1, border_color=BORDER,
-            hover_color=SURFACE, text_color=SECTION_FG,
-            command=self._toggle_all_groups,
-        )
-        self._collapse_btn.pack(side="left", padx=(8, 0))
+    def _build_tabs(self, outer: QVBoxLayout) -> None:
+        tab_container = QWidget()
+        tab_container.setFixedHeight(44)
+        tcl = QHBoxLayout(tab_container)
+        tcl.setContentsMargins(0, 0, 6, 0)
+        tcl.setSpacing(0)
 
-    # ── Tab bar ───────────────────────────────────────────────────────────────
+        scroll = QScrollArea()
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidgetResizable(True)
+        scroll.setFixedHeight(44)
 
-    # human-readable labels for built-in tabs
-    _BUILTIN_LABELS = {"web": "Websites", "app": "Apps"}
+        self._tab_inner = QWidget()
+        self._tab_row = QHBoxLayout(self._tab_inner)
+        self._tab_row.setContentsMargins(0, 0, 0, 0)
+        self._tab_row.setSpacing(0)
+        scroll.setWidget(self._tab_inner)
+        tcl.addWidget(scroll, 1)
 
-    def _build_tabs(self) -> None:
-        outer = ctk.CTkFrame(self, fg_color=HEADER_BG, corner_radius=0)
-        outer.pack(fill="x")
-        ctk.CTkFrame(outer, height=1, fg_color=BORDER, corner_radius=0).pack(fill="x")
+        add_tab_btn = QPushButton("+")
+        add_tab_btn.setFixedSize(34, 34)
+        add_tab_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        add_tab_btn.clicked.connect(self._open_add_tab)
+        tcl.addWidget(add_tab_btn, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        row = tk.Frame(outer, bg=HEADER_BG)
-        row.pack(fill="x")
-
-        # Scroll arrows — packed after canvas so they sit flush at each side
-        self._tab_scroll_left = tk.Button(
-            row, text="‹", bg=HEADER_BG, fg=TEXT2,
-            font=("Segoe UI", 14, "bold"), relief="flat", bd=0,
-            activebackground=SURFACE, activeforeground=TEXT,
-            cursor="hand2", padx=4,
-            command=lambda: self._tab_canvas.xview_scroll(-3, "units"),
-        )
-        self._tab_scroll_right = tk.Button(
-            row, text="›", bg=HEADER_BG, fg=TEXT2,
-            font=("Segoe UI", 14, "bold"), relief="flat", bd=0,
-            activebackground=SURFACE, activeforeground=TEXT,
-            cursor="hand2", padx=4,
-            command=lambda: self._tab_canvas.xview_scroll(3, "units"),
-        )
-
-        # "+ Tab" button — always visible, fixed on right
-        tk.Button(
-            row, text="+",
-            bg=HEADER_BG, fg=TEXT2,
-            font=("Segoe UI", 15), relief="flat", bd=0,
-            activebackground=SURFACE, activeforeground=TEXT,
-            cursor="hand2", padx=8, pady=2,
-            command=self._open_add_tab,
-        ).pack(side="right", padx=(0, 6))
-
-        self._tab_canvas = tk.Canvas(row, height=44, bg=HEADER_BG,
-                                      highlightthickness=0, bd=0)
-        self._tab_canvas.pack(side="left", fill="x", expand=True)
-
-        self._tab_inner = tk.Frame(self._tab_canvas, bg=HEADER_BG)
-        self._tab_canvas.create_window((0, 0), window=self._tab_inner, anchor="nw")
-
-        self._tab_inner.bind("<Configure>",  self._on_tab_inner_configure)
-        self._tab_canvas.bind("<Configure>", self._on_tab_canvas_configure)
-        self._tab_canvas.bind("<MouseWheel>", self._on_tab_scroll)
-
+        outer.addWidget(tab_container)
+        outer.addWidget(_separator())
         self._rebuild_tab_row()
 
-    # ── Tab-bar rebuild ───────────────────────────────────────────────────────
-
     def _rebuild_tab_row(self) -> None:
-        """Destroy and recreate all tab widgets in the canvas inner frame."""
-        for w in self._tab_inner.winfo_children():
-            w.destroy()
+        while self._tab_row.count():
+            item = self._tab_row.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
         self._tab_btns.clear()
 
         try:
-            self._custom_tabs = self._app.vault.get_custom_tabs()
+            self._custom_tabs = self._win.vault.get_custom_tabs()
         except Exception:
             self._custom_tabs = []
 
         try:
-            self._tab_order = self._app.vault.get_tab_order()
+            self._tab_order = self._win.vault.get_tab_order()
         except Exception:
             self._tab_order = ["web", "app"] + list(self._custom_tabs)
 
-        self._tab_w = self._calc_tab_width()
-
         for key in self._tab_order:
-            label = self._BUILTIN_LABELS.get(key, key)
-            is_active  = key == self._active_tab
-            is_custom  = key not in self._BUILTIN_LABELS
+            label     = self.BUILTIN_LABELS.get(key, key)
+            is_active = key == self._active_tab
+            is_custom = key not in self.BUILTIN_LABELS
+            btn = TabButton(key, label, is_active, is_custom, self._tab_inner)
+            btn.setMinimumWidth(80)
+            btn.clicked.connect(self._switch_tab)
+            btn.remove_requested.connect(self._remove_tab)
+            self._tab_row.addWidget(btn)
+            self._tab_btns[key] = btn
+        self._tab_row.addStretch(1)
 
-            wrap = tk.Frame(self._tab_inner, bg=HEADER_BG,
-                            width=self._tab_w, height=44)
-            wrap.pack(side="left")
-            wrap.pack_propagate(False)
-
-            lbl = tk.Label(
-                wrap, text=label,
-                bg=HEADER_BG, fg=ACCENT if is_active else TEXT2,
-                font=("Segoe UI", 11), cursor="hand2",
-            )
-            lbl.place(relx=0.5 if not is_custom else 0.45,
-                      rely=0.42, anchor="center")
-
-            underline = tk.Frame(wrap, height=2,
-                                 bg=ACCENT if is_active else HEADER_BG)
-            underline.place(relx=0, rely=1.0, anchor="sw", relwidth=1)
-
-            if is_custom:
-                x_lbl = tk.Label(
-                    wrap, text="×",
-                    bg=HEADER_BG, fg=BORDER,
-                    font=("Segoe UI", 12), cursor="hand2",
-                )
-                x_lbl.place(relx=0.92, rely=0.38, anchor="center")
-                x_lbl.bind("<ButtonPress-1>",
-                            lambda e, k=key: self._remove_tab(k))
-                x_lbl.bind("<Enter>",
-                            lambda e, xl=x_lbl: xl.configure(fg=DANGER))
-                x_lbl.bind("<Leave>",
-                            lambda e, xl=x_lbl: xl.configure(fg=BORDER))
-
-            self._tab_btns[key] = (lbl, underline)
-
-            for widget in (wrap, lbl, underline):
-                widget.bind("<MouseWheel>",     self._on_tab_scroll)
-                widget.bind("<ButtonPress-1>",  lambda e, k=key: self._on_tab_press(e, k))
-                widget.bind("<B1-Motion>",       self._on_tab_motion)
-                widget.bind("<ButtonRelease-1>", self._on_tab_release)
-
-        self._tab_inner.update_idletasks()
-        self._tab_canvas.configure(
-            scrollregion=self._tab_canvas.bbox("all") or (0, 0, 0, 0)
-        )
-        self._update_scroll_buttons()
-
-    def _calc_tab_width(self) -> int:
-        n = len(self._tab_order)
-        if n == 0:
-            return 140
-        canvas_w = self._tab_canvas.winfo_width()
-        if canvas_w <= 1:
-            return 140
-        ideal = canvas_w // n
-        return max(80, min(180, ideal))
-
-    def _on_tab_inner_configure(self, _event=None) -> None:
-        self._tab_canvas.configure(
-            scrollregion=self._tab_canvas.bbox("all") or (0, 0, 0, 0)
-        )
-        self._update_scroll_buttons()
-
-    def _on_tab_canvas_configure(self, _event=None) -> None:
-        new_w = self._calc_tab_width()
-        if new_w != self._tab_w:
-            self._tab_w = new_w
-            self._rebuild_tab_row()
-        else:
-            self._update_scroll_buttons()
-
-    def _update_scroll_buttons(self) -> None:
-        try:
-            inner_w = self._tab_inner.winfo_reqwidth()
-            canvas_w = self._tab_canvas.winfo_width()
-            needs_scroll = inner_w > canvas_w + 2
-            if needs_scroll:
-                self._tab_scroll_left.pack(side="left",  before=self._tab_canvas, padx=(4, 0))
-                self._tab_scroll_right.pack(side="right", before=self._tab_canvas)
-            else:
-                self._tab_scroll_left.pack_forget()
-                self._tab_scroll_right.pack_forget()
-        except Exception:
-            pass
-
-    def _on_tab_scroll(self, event) -> None:
-        self._tab_canvas.xview_scroll(int(-1 * (event.delta / 120)), "units")
-
-    # ── Tab drag-to-reorder ───────────────────────────────────────────────────
-
-    def _on_tab_press(self, event, key: str) -> None:
-        self._drag_tab_key      = key
-        self._drag_tab_press_xy = (event.x_root, event.y_root)
-        self._drag_tab_active   = False
-        # Record where within the tab the click landed so the ghost follows naturally
-        try:
-            canvas_x = self._tab_canvas.canvasx(
-                event.x_root - self._tab_canvas.winfo_rootx()
-            )
-            tab_idx = self._tab_order.index(key) if key in self._tab_order else 0
-            self._drag_tab_offset = int(canvas_x) - tab_idx * self._tab_w
-        except Exception:
-            self._drag_tab_offset = self._tab_w // 2
-
-    def _on_tab_motion(self, event) -> None:
-        if not self._drag_tab_key or not self._drag_tab_press_xy:
-            return
-        if not self._drag_tab_active:
-            if abs(event.x_root - self._drag_tab_press_xy[0]) < 6:
-                return
-            self._drag_tab_active = True
-            self._drag_tab_start(event)
-        if self._drag_tab_active:
-            self._drag_tab_update(event)
-
-    def _on_tab_release(self, event) -> None:
-        if self._drag_tab_active and self._drag_tab_key:
-            self._drag_tab_commit(event)
-        elif self._drag_tab_key and not self._drag_tab_active:
-            self._switch_tab(self._drag_tab_key)
-        self._drag_tab_cleanup()
-
-    def _drag_tab_start(self, event) -> None:
-        if self._drag_tab_ghost and self._drag_tab_ghost.winfo_exists():
-            self._drag_tab_ghost.destroy()
-        key   = self._drag_tab_key
-        label = self._BUILTIN_LABELS.get(key, key)
-        ghost = tk.Frame(
-            self._app, bg=ACCENT,
-            highlightthickness=1, highlightbackground=ACCENT_HV,
-        )
-        tk.Label(ghost, text=f"  {label}  ",
-                 bg=ACCENT, fg="#ffffff",
-                 font=("Segoe UI", 11), pady=5).pack()
-        ghost.place(x=-300, y=-300)
-        ghost.lift()
-        self._drag_tab_ghost = ghost
-
-    def _drag_tab_update(self, event) -> None:
-        if self._drag_tab_ghost and self._drag_tab_ghost.winfo_exists():
-            offset = getattr(self, "_drag_tab_offset", self._tab_w // 2)
-            x = event.x_root - self._app.winfo_rootx() - offset
-            y = self._tab_canvas.winfo_rooty() - self._app.winfo_rooty()
-            self._drag_tab_ghost.place(x=x, y=y)
-
-    def _drag_tab_commit(self, event) -> None:
-        raw_x    = event.x_root - self._tab_canvas.winfo_rootx()
-        canvas_x = self._tab_canvas.canvasx(raw_x)
-        tw       = max(1, self._tab_w)
-        target   = max(0, min(int(canvas_x) // tw, len(self._tab_order) - 1))
-        key      = self._drag_tab_key
-        if key in self._tab_order:
-            order = list(self._tab_order)
-            order.pop(order.index(key))
-            order.insert(target, key)
-            self._tab_order = order
-            try:
-                self._app.vault.set_tab_order(order)
-            except Exception:
-                pass
-
-    def _drag_tab_cleanup(self) -> None:
-        if self._drag_tab_ghost and self._drag_tab_ghost.winfo_exists():
-            self._drag_tab_ghost.destroy()
-        self._drag_tab_ghost    = None
-        self._drag_tab_key      = None
-        self._drag_tab_press_xy = None
-        was_active = self._drag_tab_active
-        self._drag_tab_active   = False
-        if was_active:
-            self._rebuild_tab_row()
-
-    # ── Tab switch ────────────────────────────────────────────────────────────
-
-    def _switch_tab(self, tab: str) -> None:
-        self._active_tab = tab
-        for key, (lbl, underline) in self._tab_btns.items():
-            active = key == tab
-            lbl.configure(fg=ACCENT if active else TEXT2)
-            underline.configure(bg=ACCENT if active else HEADER_BG)
-        self._scroll.pack(fill="both", expand=True)
+    def _switch_tab(self, key: str) -> None:
+        self._active_tab = key
+        for k, btn in self._tab_btns.items():
+            btn.set_active(k == key)
         self._refresh()
 
-    # ── Scrollable list ───────────────────────────────────────────────────────
+    # ── Scroll list ─────────────────────────────────────────────────────────────
 
-    def _build_list(self) -> None:
-        self._scroll = ctk.CTkScrollableFrame(
-            self, fg_color=BG,
-            scrollbar_button_color=BORDER,
-            scrollbar_button_hover_color=SURFACE_HV,
-            corner_radius=0,
-        )
-        self._scroll.pack(fill="both", expand=True)
+    def _build_list(self, outer: QVBoxLayout) -> None:
+        self._scroll_area = QScrollArea()
+        self._scroll_area.setWidgetResizable(True)
+        self._scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
-        self._empty = ctk.CTkFrame(self._scroll, fg_color="transparent")
-        ctk.CTkLabel(
-            self._empty, text="🔑",
-            font=("Segoe UI Emoji", 48), text_color=BORDER,
-        ).pack(pady=(60, 10))
-        self._empty_title = ctk.CTkLabel(
-            self._empty, text="No passwords saved yet",
-            font=FONT_BOLD, text_color=TEXT2,
-        )
-        self._empty_title.pack()
-        self._empty_sub = ctk.CTkLabel(
-            self._empty, text='Click  "+ Add"  to save your first login',
-            font=FONT_SM, text_color=BORDER,
-        )
-        self._empty_sub.pack(pady=(4, 0))
+        self._list_widget = _DropTarget(self._remove_from_group)
+        self._list_layout = QVBoxLayout(self._list_widget)
+        self._list_layout.setContentsMargins(14, 8, 14, 14)
+        self._list_layout.setSpacing(4)
+        self._list_layout.addStretch(1)
 
-    # ── Data refresh ──────────────────────────────────────────────────────────
+        self._scroll_area.setWidget(self._list_widget)
+        outer.addWidget(self._scroll_area, 1)
+
+        self._empty_widget = self._make_empty_widget()
+
+    def _make_empty_widget(self) -> QWidget:
+        w = QWidget()
+        vl = QVBoxLayout(w)
+        vl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        icon_lbl = QLabel("🔑")
+        icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        vl.addWidget(icon_lbl)
+
+        self._empty_title = QLabel("No passwords saved yet")
+        self._empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        vl.addWidget(self._empty_title)
+
+        self._empty_sub = QLabel('Click  "+ Add"  to save your first login')
+        self._empty_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        vl.addWidget(self._empty_sub)
+        return w
+
+    # ── Refresh ──────────────────────────────────────────────────────────────────
 
     def _refresh(self) -> None:
-        _hover_state["item"] = None          # clear any stale reference before rebuild
         self._group_keys = []
-        self._drop_zones  = []
-        query = self._search_var.get().strip().lower()
+        self._drop_zones = []
+        self._selected_cards = []
+        self._all_cards = []
+        self._anchor_card = None
+        query = self._search.text().strip().lower()
+
         try:
-            all_creds = self._app.vault.get_all()
+            all_creds = self._win.vault.get_all()
         except VaultError:
             return
 
@@ -884,303 +1150,194 @@ class MainFrame(ctk.CTkFrame):
         else:
             creds = all_creds
 
-        for w in self._scroll.winfo_children():
-            if w is not self._empty:
-                w.destroy()
+        while self._list_layout.count() > 1:
+            item = self._list_layout.takeAt(0)
+            w = item.widget()
+            if w and w is not self._empty_widget:
+                w.deleteLater()
+        if self._empty_widget.parent():
+            self._empty_widget.setParent(None)
 
         active = [c for c in creds if c.get("cred_type", "web") == self._active_tab]
 
         if not active:
             if query:
-                self._empty_title.configure(text=f'No results for "{query}"')
-                self._empty_sub.configure(text="Try a different search term")
+                self._empty_title.setText(f'No results for "{query}"')
+                self._empty_sub.setText("Try a different search term")
             elif self._active_tab == "app":
-                self._empty_title.configure(text="No app logins saved yet")
-                self._empty_sub.configure(text='Click  "+ Add"  →  select  "App"  to add one')
+                self._empty_title.setText("No app logins saved yet")
+                self._empty_sub.setText('Click  "+ Add"  →  select  "App"  to add one')
             elif self._active_tab == "web":
-                self._empty_title.configure(text="No website logins saved yet")
-                self._empty_sub.configure(text='Click  "+ Add"  to save your first login')
+                self._empty_title.setText("No website logins saved yet")
+                self._empty_sub.setText('Click  "+ Add"  to save your first login')
             else:
-                tab_label = self._active_tab
-                self._empty_title.configure(text=f'No "{tab_label}" logins saved yet')
-                self._empty_sub.configure(text='Click  "+ Add"  to add one')
-            self._empty.pack(fill="x")
-            self._count_lbl.configure(text=f"{total} saved" if total else "")
+                self._empty_title.setText(f'No "{self._active_tab}" logins saved yet')
+                self._empty_sub.setText('Click  "+ Add"  to add one')
+            self._empty_widget.setParent(self._list_widget)
+            self._list_layout.insertWidget(0, self._empty_widget)
+            self._empty_widget.show()
+            self._count_lbl.setText(f"{total} saved" if total else "")
             self._update_collapse_btn()
             return
 
-        self._empty.pack_forget()
+        if query:
+            for i, cred in enumerate(active):
+                card = CredentialCard(
+                    self._list_widget, cred,
+                    on_copy=self._win.copy_password,
+                    on_edit=self._open_edit,
+                    on_delete=self._do_delete,
+                    on_select=self._on_card_select,
+                    on_drag=self._on_card_drag,
+                )
+                self._list_layout.insertWidget(i, card)
+                self._all_cards.append(card)
+            self._count_lbl.setText(f"{len(active)} of {total}")
+            self._update_collapse_btn()
+            return
 
-        def _group(cred_list: list) -> dict[str, list]:
-            groups: dict[str, list] = {}
-            for c in cred_list:
-                key = c.get("group_name") or c["domain"]
-                groups.setdefault(key, []).append(c)
-            return groups
-
-        # Fetch standalone (possibly empty) groups created via + Group
         try:
-            standalone: set[str] = set(self._app.vault.get_groups(self._active_tab))
+            standalone: set[str] = set(self._win.vault.get_groups(self._active_tab))
         except Exception:
             standalone = set()
 
-        # Pre-populate grouping dict with standalone groups so they appear even when empty
         grouped: dict[str, list] = {name: [] for name in standalone}
         for c in active:
             key = c.get("group_name") or c["domain"]
             grouped.setdefault(key, []).append(c)
 
-        _color_counts: dict[int, int] = {}
-
-        def _variant(name: str) -> int:
-            idx = ord(name[0].upper()) % len(_AVATAR_PALETTE) if name else 0
-            n = _color_counts.get(idx, 0)
-            _color_counts[idx] = n + 1
-            return n % 2
-
         use_app_name = self._active_tab != "web"
+        insert_pos = 0
+
         for key, group in sorted(grouped.items(), key=lambda x: x[0].lower()):
             is_manual = key in standalone or (group and bool(group[0].get("group_name")))
             if use_app_name:
                 display = key if is_manual else ((group[0].get("app_name") or key) if group else key)
-                self._render_group(display, group, group_key=key,
-                                   variant=_variant(display), is_manual=is_manual)
             else:
-                self._render_group(key, group, variant=_variant(key), is_manual=is_manual)
+                display = key
 
-        ctk.CTkFrame(self._scroll, height=14, fg_color="transparent").pack()
-        tab_total = len(active)
-        self._count_lbl.configure(
-            text=f"{len(active)} of {tab_total}" if query else f"{tab_total} saved"
-        )
+            if len(group) == 1 and not is_manual:
+                card = CredentialCard(
+                    self._list_widget, group[0],
+                    on_copy=self._win.copy_password,
+                    on_edit=self._open_edit,
+                    on_delete=self._do_delete,
+                    on_select=self._on_card_select,
+                    on_drag=self._on_card_drag,
+                )
+                self._list_layout.insertWidget(insert_pos, card)
+                self._all_cards.append(card)
+            else:
+                self._group_keys.append(key)
+                default_collapsed = len(group) > 0
+                grp = CredentialGroup(
+                    self._list_widget,
+                    display_name=display,
+                    group_key=key,
+                    creds=group,
+                    collapsed=self._collapsed.get(key, default_collapsed),
+                    on_toggle=self._on_group_toggle,
+                    on_copy=self._win.copy_password,
+                    on_edit=self._open_edit,
+                    on_delete=self._do_delete,
+                    on_register_drop=self._register_drop_zone if is_manual else None,
+                    is_manual=is_manual,
+                    on_delete_group=self._delete_group if is_manual else None,
+                    on_drop=self._move_to_group if is_manual else None,
+                )
+                self._list_layout.insertWidget(insert_pos, grp)
+            insert_pos += 1
+
+        self._count_lbl.setText(f"{len(active)} saved")
         self._update_collapse_btn()
 
-    def _section_label(self, text: str) -> None:
-        row = ctk.CTkFrame(self._scroll, fg_color="transparent")
-        row.pack(fill="x", padx=14, pady=(14, 3))
-        ctk.CTkLabel(
-            row, text=text,
-            font=("Segoe UI", 10, "bold"), text_color=SECTION_FG,
-        ).pack(side="left")
-        ctk.CTkFrame(row, height=1, fg_color=BORDER, corner_radius=0).pack(
-            side="left", fill="x", expand=True, padx=(8, 0),
-        )
+    def _on_card_select(self, card, modifiers) -> None:
+        ctrl  = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
 
-    def _render_group(self, display_name: str, group: list, group_key: str | None = None,
-                      variant: int = 0, is_manual: bool = False) -> None:
-        key = group_key or display_name
-        # A single credential that belongs to no named group → plain card
-        if len(group) == 1 and not is_manual:
-            CredentialCard(
-                self._scroll, group[0],
-                on_copy=self._copy_password,
-                on_edit=self._open_edit,
-                on_delete=self._do_delete,
-                avatar_variant=variant,
-            ).pack(fill="x", padx=14, pady=(4, 0))
+        if shift and self._anchor_card and self._anchor_card in self._all_cards and card in self._all_cards:
+            i1 = self._all_cards.index(self._anchor_card)
+            i2 = self._all_cards.index(card)
+            lo, hi = min(i1, i2), max(i1, i2)
+            for c in list(self._selected_cards):
+                c.set_selected(False)
+            self._selected_cards = []
+            for c in self._all_cards[lo:hi + 1]:
+                c.set_selected(True)
+                self._selected_cards.append(c)
+        elif ctrl:
+            card.set_selected(not card._selected)
+            if card._selected:
+                if card not in self._selected_cards:
+                    self._selected_cards.append(card)
+            else:
+                if card in self._selected_cards:
+                    self._selected_cards.remove(card)
+            self._anchor_card = card
         else:
-            # Named or multi-credential group (may be empty)
-            self._group_keys.append(key)
-            # Empty groups start expanded so the drop hint is visible
-            default_collapsed = len(group) > 0
-            CredentialGroup(
-                self._scroll,
-                display_name=display_name,
-                group_key=key,
-                creds=group,
-                collapsed=self._collapsed.get(key, default_collapsed),
-                on_toggle=self._on_group_toggle,
-                on_copy=self._copy_password,
-                on_edit=self._open_edit,
-                on_delete=self._do_delete,
-                avatar_variant=variant,
-                on_register_drop=self._register_drop_zone if is_manual else None,
-                is_manual=is_manual,
-                on_delete_group=self._delete_group if is_manual else None,
-            ).pack(fill="x", padx=14, pady=(4, 0))
+            for c in list(self._selected_cards):
+                c.set_selected(False)
+            self._selected_cards = [card]
+            card.set_selected(True)
+            self._anchor_card = card
+
+    def _on_card_drag(self, card) -> None:
+        if not card._selected:
+            for c in list(self._selected_cards):
+                c.set_selected(False)
+            self._selected_cards = [card]
+            card.set_selected(True)
+        dragging = list(self._selected_cards)
+        cred_ids = [c._cred["id"] for c in dragging]
+        drag = QDrag(self._list_widget)
+        mime = QMimeData()
+        mime.setData("application/x-credential-ids",
+                     json.dumps(cred_ids).encode("utf-8"))
+        drag.setMimeData(mime)
+        result = drag.exec(Qt.DropAction.MoveAction)
+        drag.deleteLater()
+        if result != Qt.DropAction.MoveAction:
+            for c in dragging:
+                if c in self._all_cards:
+                    c.set_selected(True)
+
+    def _move_to_group(self, group_key: str, cred_ids: list) -> None:
+        for cred_id in cred_ids:
+            try:
+                self._win.vault.update(cred_id, group_name=group_key)
+            except Exception:
+                pass
+        self._selected_cards = []
+        QTimer.singleShot(0, self._refresh)
 
     def _on_group_toggle(self, key: str, collapsed: bool) -> None:
         self._collapsed[key] = collapsed
         self._update_collapse_btn()
 
-    # ── Group creation ────────────────────────────────────────────────────────
-
-    def _open_new_group(self) -> None:
-        GroupNameDialog(self._app, on_create=self._on_create_group)
-
-    def _on_create_group(self, name: str) -> None:
-        try:
-            self._app.vault.create_group(name, self._active_tab)
-        except Exception:
-            pass
-        self._refresh()
-
-    def _delete_group(self, group_key: str) -> None:
-        if messagebox.askyesno(
-            "Delete Group",
-            f"Delete group '{group_key}'?\n\n"
-            "All credentials inside will be moved back to the main list.",
-            icon="warning", parent=self._app,
-        ):
-            self._app.vault.delete_group(group_key, self._active_tab)
-            self._refresh()
-
-    # ── Custom-tab management ────────────────────────────────────────────────
-
-    def _open_add_tab(self) -> None:
-        GroupNameDialog(
-            self._app, on_create=self._do_add_tab,
-            title="New Tab", header="New Tab",
-            placeholder="e.g. PIN Codes, Wi-Fi, Notes…",
-        )
-
-    def _do_add_tab(self, name: str) -> None:
-        if name in self._BUILTIN_LABELS:
-            return
-        try:
-            self._app.vault.create_custom_tab(name)
-        except Exception:
-            pass
-        self._active_tab = name
-        self._rebuild_tab_row()
-        self._refresh()
-
-    def _remove_tab(self, tab_name: str) -> None:
-        if not messagebox.askyesno(
-            "Remove Tab",
-            f"Remove tab '{tab_name}'?\n\n"
-            "Its credentials will be moved to Websites.",
-            icon="warning", parent=self._app,
-        ):
-            return
-        self._app.vault.delete_custom_tab(tab_name)
-        if self._active_tab == tab_name:
-            self._active_tab = "web"
-        self._rebuild_tab_row()
-        self._switch_tab(self._active_tab)
-
-    # ── Generator dialog ─────────────────────────────────────────────────────
-
-    def _open_generator(self) -> None:
-        GeneratorDialog(self._app)
-
-    # ── Drag-to-group ─────────────────────────────────────────────────────────
-
-    def _register_drop_zone(self, key: str, widget) -> None:
-        self._drop_zones.append((key, widget))
-
-    def _drag_start(self, cred: dict) -> None:
-        # Floating label via place() inside the main window — no new Toplevel,
-        # no focus steal, no broken mouse capture.
-        if self._drag_label and self._drag_label.winfo_exists():
-            self._drag_label.destroy()
-        self._drag_label = tk.Frame(
-            self._app, bg=SURFACE,
-            highlightthickness=1, highlightbackground=BORDER_HL,
-        )
-        tk.Label(
-            self._drag_label, text=f"  {cred['username']}  ",
-            bg=SURFACE, fg=TEXT, font=("Segoe UI", 11), pady=4,
-        ).pack()
-        self._drag_label.place(x=-300, y=-300)  # off-screen until first motion
-        self._drag_label.lift()
-
-
-    def _drag_motion(self, x_root: int, y_root: int) -> None:
-        if self._drag_label and self._drag_label.winfo_exists():
-            x = x_root - self._app.winfo_rootx() + 14
-            y = y_root - self._app.winfo_rooty() + 14
-            self._drag_label.place(x=x, y=y)
-
-    def _drag_end(self, cred: dict, x_root: int, y_root: int) -> None:
-        if self._drag_label and self._drag_label.winfo_exists():
-            self._drag_label.destroy()
-        self._drag_label = None
-
-        # Check drop targets
-        for key, w in self._drop_zones:
-            try:
-                wx, wy = w.winfo_rootx(), w.winfo_rooty()
-                ww, wh = w.winfo_width(), w.winfo_height()
-                if wx <= x_root <= wx + ww and wy <= y_root <= wy + wh:
-                    if key != (cred.get("group_name") or cred["domain"]):
-                        self._app.vault.update(cred["id"], group_name=key)
-                        self._refresh()
-                    return
-            except Exception:
-                pass
-
-        # Dropped outside any group — remove from manual group if it was in one
-        if cred.get("group_name"):
-            self._app.vault.update(cred["id"], group_name="")
-            self._refresh()
-
     def _update_collapse_btn(self) -> None:
         if not self._group_keys:
-            self._collapse_btn.configure(text="Expand All", text_color=SECTION_FG)
+            self._collapse_btn.setText("Expand All")
             return
         all_collapsed = all(self._collapsed.get(k, True) for k in self._group_keys)
-        self._collapse_btn.configure(
-            text="Expand All" if all_collapsed else "Collapse All",
-            text_color=TEXT2,
-        )
+        self._collapse_btn.setText("Expand All" if all_collapsed else "Collapse All")
 
     def _toggle_all_groups(self) -> None:
         if not self._group_keys:
             return
         any_expanded = any(not self._collapsed.get(k, True) for k in self._group_keys)
-        new_state = any_expanded   # collapse all if any open; expand all if all closed
+        new_state = any_expanded
         for k in self._group_keys:
             self._collapsed[k] = new_state
         self._refresh()
 
-    # ── Global drag handlers ──────────────────────────────────────────────────
+    def _register_drop_zone(self, key: str, widget) -> None:
+        self._drop_zones.append((key, widget))
 
-    def _find_drag_cred(self, widget) -> dict | None:
-        """Walk up the widget tree to find the credential being dragged."""
-        w = widget
-        while w is not None:
-            if isinstance(w, ctk.CTkButton):
-                return None  # buttons handle their own clicks
-            if isinstance(w, CredentialCard):
-                return w._cred
-            if hasattr(w, '_drag_cred_tag'):
-                return w._drag_cred_tag
-            try:
-                w = w.master
-            except AttributeError:
-                break
-        return None
-
-    def _on_global_press(self, e) -> None:
-        self._drag_cred    = self._find_drag_cred(e.widget)
-        self._drag_press_xy = (e.x_root, e.y_root) if self._drag_cred else None
-        self._drag_active  = False
-
-    def _on_global_motion(self, e) -> None:
-        if not self._drag_cred or not self._drag_press_xy:
-            return
-        if not self._drag_active:
-            dx = abs(e.x_root - self._drag_press_xy[0])
-            dy = abs(e.y_root - self._drag_press_xy[1])
-            if dx > 6 or dy > 6:
-                self._drag_active = True
-                self._drag_start(self._drag_cred)
-        if self._drag_active:
-            self._drag_motion(e.x_root, e.y_root)
-
-    def _on_global_release(self, e) -> None:
-        if self._drag_active and self._drag_cred is not None:
-            self._drag_end(self._drag_cred, e.x_root, e.y_root)
-        self._drag_cred     = None
-        self._drag_press_xy = None
-        self._drag_active   = False
-
-    # ── DB watcher ────────────────────────────────────────────────────────────
+    # ── DB watcher ───────────────────────────────────────────────────────────────
 
     def _get_db_hash(self) -> str:
         try:
-            creds = self._app.vault.get_all()
+            creds = self._win.vault.get_all()
             payload = str([(c["id"], c["updated_at"]) for c in creds])
             return hashlib.md5(payload.encode()).hexdigest()
         except Exception:
@@ -1194,56 +1351,35 @@ class MainFrame(ctk.CTkFrame):
                 self._refresh()
         except Exception:
             pass
-        self.after(2000, self._poll_db)
 
-    # ── Clipboard ─────────────────────────────────────────────────────────────
-
-    def _copy_password(self, cred: dict, card=None) -> None:
-        if self._clip_timer:
-            self._clip_timer.cancel()
-        self.clipboard_clear()
-        self.clipboard_append(cred["password"])
-        self.update()
-        if card is not None:
-            card.flash_copied()
-        self._clip_timer = threading.Timer(
-            CLIP_TTL, lambda: self.after(0, self._clear_clip)
-        )
-        self._clip_timer.daemon = True
-        self._clip_timer.start()
-
-    def _clear_clip(self) -> None:
-        try:
-            self.clipboard_clear()
-            self.update()
-        except Exception:
-            pass
-
-    # ── CRUD ──────────────────────────────────────────────────────────────────
+    # ── CRUD ─────────────────────────────────────────────────────────────────────
 
     def _open_add(self) -> None:
         preset = {"web": "Website", "app": "App"}.get(self._active_tab, self._active_tab)
-        CredentialDialog(
-            self._app, on_save=self._on_add,
+        dlg = CredentialDialog(
+            self._win, on_save=self._on_add,
             existing_groups=self._get_existing_groups(),
             custom_tabs=self._custom_tabs,
             preset_type=preset,
         )
+        dlg.exec()
 
     def _open_edit(self, cred: dict) -> None:
-        CredentialDialog(
-            self._app, existing=cred,
+        dlg = CredentialDialog(
+            self._win, existing=cred,
             on_save=lambda d: self._on_edit(cred["id"], d),
             existing_groups=self._get_existing_groups(),
             custom_tabs=self._custom_tabs,
         )
+        dlg.exec()
 
     def _get_existing_groups(self) -> list[str]:
         try:
-            from_creds = {c["group_name"] for c in self._app.vault.get_all() if c.get("group_name")}
+            from_creds = {c["group_name"] for c in self._win.vault.get_all()
+                          if c.get("group_name")}
             from_table: set[str] = set()
             for t in ["web", "app"] + list(self._custom_tabs):
-                from_table |= set(self._app.vault.get_groups(t))
+                from_table |= set(self._win.vault.get_groups(t))
             return sorted(from_creds | from_table)
         except Exception:
             return []
@@ -1252,33 +1388,25 @@ class MainFrame(ctk.CTkFrame):
         group = data.get("group_name", "")
         ct    = data.get("cred_type", "web")
         if ct == "app":
-            self._app.vault.save_app(data["app_name"], data["username"], data["password"], group)
+            self._win.vault.save_app(data["app_name"], data["username"], data["password"], group)
         elif ct == "web":
-            self._app.vault.save(data["url"], data["username"], data["password"], group)
+            self._win.vault.save(data["url"], data["username"], data["password"], group)
         else:
-            self._app.vault.save_to_tab(data["app_name"], data["username"], data["password"], ct, group)
+            self._win.vault.save_to_tab(data["app_name"], data["username"], data["password"], ct, group)
         self._refresh()
 
     def _on_edit(self, cred_id: int, data: dict) -> None:
-        target  = data.get("target_tab")
-        source  = data.get("cred_type", "web")
-        new_ct  = target if (target and target != source) else None
-
-        # When moving to Apps and app_name is still empty, use the best available label
+        target = data.get("target_tab")
+        source = data.get("cred_type", "web")
+        new_ct = target if (target and target != source) else None
         explicit_app_name = data.get("app_name") or None
         if new_ct == "app" and not explicit_app_name:
-            # Find the existing credential to derive a name from
             try:
-                existing = self._app.vault.get_by_id(cred_id)
-                explicit_app_name = (
-                    existing.get("app_name")
-                    or existing.get("domain")
-                    or ""
-                ) or None
+                existing = self._win.vault.get_by_id(cred_id)
+                explicit_app_name = (existing.get("app_name") or existing.get("domain") or "") or None
             except Exception:
                 pass
-
-        self._app.vault.update(
+        self._win.vault.update(
             cred_id,
             username=data.get("username"),
             password=data.get("password"),
@@ -1291,48 +1419,112 @@ class MainFrame(ctk.CTkFrame):
 
     def _do_delete(self, cred: dict) -> None:
         name = cred.get("app_name") or cred["domain"]
-        if messagebox.askyesno(
-            "Delete",
-            f"Delete the saved login for  {name}?\n\nThis cannot be undone.",
-            icon="warning", parent=self._app,
-        ):
-            self._app.vault.delete(cred["id"])
+        if _confirm(self._win, "Delete",
+                    f"Delete the saved login for  {name}?\n\nThis cannot be undone."):
+            self._win.vault.delete(cred["id"])
             self._refresh()
 
+    # ── Group management ─────────────────────────────────────────────────────────
+
+    def _open_new_group(self) -> None:
+        dlg = GroupNameDialog(self._win, on_create=self._on_create_group)
+        dlg.exec()
+
+    def _on_create_group(self, name: str) -> None:
+        try:
+            self._win.vault.create_group(name, self._active_tab)
+        except Exception:
+            pass
+        self._refresh()
+
+    def _remove_from_group(self, cred_ids: list) -> None:
+        for cred_id in cred_ids:
+            try:
+                self._win.vault.update(cred_id, group_name="")
+            except Exception:
+                pass
+        QTimer.singleShot(0, self._refresh)
+
+    def _delete_group(self, group_key: str) -> None:
+        if _confirm(self._win, "Delete Group",
+                    f"Delete group '{group_key}'?\n\n"
+                    "All credentials inside will be moved back to the main list."):
+            self._win.vault.delete_group(group_key, self._active_tab)
+            self._refresh()
+
+    # ── Tab management ────────────────────────────────────────────────────────────
+
+    def _open_add_tab(self) -> None:
+        dlg = GroupNameDialog(
+            self._win, on_create=self._do_add_tab,
+            title="New Tab", header="New Tab",
+            placeholder="e.g. PIN Codes, Wi-Fi, Notes…",
+        )
+        dlg.exec()
+
+    def _do_add_tab(self, name: str) -> None:
+        if name in self.BUILTIN_LABELS:
+            return
+        try:
+            self._win.vault.create_custom_tab(name)
+        except Exception:
+            pass
+        self._active_tab = name
+        self._rebuild_tab_row()
+        self._refresh()
+
+    def _remove_tab(self, tab_name: str) -> None:
+        if not _confirm(self._win, "Remove Tab",
+                        f"Remove tab '{tab_name}'?\n\n"
+                        "Its credentials will be moved to Websites."):
+            return
+        self._win.vault.delete_custom_tab(tab_name)
+        if self._active_tab == tab_name:
+            self._active_tab = "web"
+        self._rebuild_tab_row()
+        self._switch_tab(self._active_tab)
+
+    # ── Transfer menu ─────────────────────────────────────────────────────────────
+
+    def _show_transfer_menu(self) -> None:
+        menu = QMenu(self)
+        menu.addAction("Import from CSV",      self._import_csv)
+        menu.addAction("Export to CSV",        self._export_csv)
+        menu.addSeparator()
+        menu.addAction("Restore from Backup…", self._import_json)
+        menu.addAction("Full Backup (JSON)…",  self._export_json)
+        menu.addSeparator()
+        menu.addAction("Send to Phone",        self._send_to_phone)
+        pos = self._transfer_btn.mapToGlobal(
+            QPoint(0, self._transfer_btn.height() + 2)
+        )
+        menu.exec(pos)
+
     def _import_csv(self) -> None:
-        path = filedialog.askopenfilename(
-            parent=self._app,
-            title="Import Passwords",
-            filetypes=[("CSV file", "*.csv"), ("All files", "*.*")],
+        path, _ = QFileDialog.getOpenFileName(
+            self._win, "Import Passwords", "",
+            "CSV file (*.csv);;All files (*.*)"
         )
         if not path:
             return
-
         try:
             with open(path, newline="", encoding="utf-8-sig") as f:
-                reader = csv.DictReader(f)
-                rows = list(reader)
+                rows = list(csv.DictReader(f))
         except Exception as exc:
-            messagebox.showerror("Import Failed", str(exc), parent=self._app)
+            _error(self._win, "Import Failed", str(exc))
             return
-
         if not rows:
-            messagebox.showinfo("Import", "No data found in the CSV file.",
-                                parent=self._app)
+            _info_msg(self._win, "Import", "No data found in the CSV file.")
             return
-
-        # ── Flexible column detection (case-insensitive, partial match) ──
         headers = list(rows[0].keys())
 
         def _col(*candidates) -> str | None:
             hl = {h.lower(): h for h in headers}
             for c in candidates:
-                if c in hl:
-                    return hl[c]
+                if c in hl: return hl[c]
             for c in candidates:
                 for hl_key, h in hl.items():
-                    if c in hl_key:
-                        return h
+                    if c in hl_key: return h
             return None
 
         col_url   = _col("url", "website", "web site", "site", "login_uri")
@@ -1340,913 +1532,751 @@ class MainFrame(ctk.CTkFrame):
         col_pass  = _col("password", "pass", "login_password")
         col_title = _col("title", "name", "account", "label")
         col_type  = _col("type")
+        col_group = _col("group", "group_name")
+        col_tab   = _col("tab", "tab_name")
 
         if not col_user or not col_pass:
-            messagebox.showerror(
-                "Import Failed",
-                "Could not find username/password columns.\n\n"
-                f"Columns found: {', '.join(headers)}",
-                parent=self._app,
-            )
+            _error(self._win, "Import Failed",
+                   f"Could not find username/password columns.\n\n"
+                   f"Columns found: {', '.join(headers)}")
             return
+
+        vault = self._win.vault
+
+        if col_tab:
+            known_tabs = {"web", "app"} | set(vault.get_custom_tabs())
+            for row in rows:
+                t = row.get(col_tab, "").strip()
+                if t and t not in known_tabs:
+                    try:
+                        vault.create_custom_tab(t)
+                        known_tabs.add(t)
+                    except Exception:
+                        pass
+
+        if col_group and col_tab:
+            existing_groups: dict[str, set] = {}
+            for row in rows:
+                g = row.get(col_group, "").strip()
+                t = row.get(col_tab, "").strip() or "web"
+                if g:
+                    existing_groups.setdefault(t, set()).add(g)
+            for tab_name, names in existing_groups.items():
+                for name in names:
+                    try:
+                        vault.create_group(name, tab_name)
+                    except Exception:
+                        pass
 
         imported = skipped = 0
         for row in rows:
-            username = row.get(col_user, "").strip()
-            password = row.get(col_pass, "").strip()
-            url      = row.get(col_url,   "").strip() if col_url   else ""
-            title    = row.get(col_title, "").strip() if col_title else ""
-            raw_type = row.get(col_type,  "").strip().lower() if col_type else ""
+            username   = row.get(col_user,  "").strip()
+            password   = row.get(col_pass,  "").strip()
+            url        = row.get(col_url,   "").strip() if col_url   else ""
+            title      = row.get(col_title, "").strip() if col_title else ""
+            group_name = row.get(col_group, "").strip() if col_group else ""
+            raw_tab    = row.get(col_tab,   "").strip() if col_tab   else ""
+            raw_type   = row.get(col_type,  "").strip().lower() if col_type else ""
 
             if not username or not password:
                 skipped += 1
                 continue
 
-            cred_type = raw_type if raw_type in ("web", "app") else (
-                "app" if (not url and title) else "web"
-            )
+            if raw_tab:
+                cred_type = raw_tab
+            elif raw_type in ("web", "app"):
+                cred_type = raw_type
+            else:
+                cred_type = "app" if (not url and title) else "web"
 
             try:
-                if cred_type == "app":
-                    self._app.vault.save_app(title or username, username, password)
-                else:
+                if cred_type == "web":
                     if not url:
                         skipped += 1
                         continue
-                    self._app.vault.save(url, username, password)
+                    vault.save(url, username, password, group_name)
+                elif cred_type == "app":
+                    vault.save_app(title or username, username, password, group_name)
+                else:
+                    vault.save_to_tab(title or username, username, password,
+                                      cred_type, group_name)
                 imported += 1
             except Exception:
                 skipped += 1
 
         self._refresh()
         skip_note = f"\nSkipped {skipped} rows (missing required fields)." if skipped else ""
-        messagebox.showinfo(
-            "Import Complete",
-            f"Imported {imported} credential{'s' if imported != 1 else ''}."
-            + skip_note,
-            parent=self._app,
-        )
+        _info_msg(self._win, "Import Complete",
+                  f"Imported {imported} credential{'s' if imported != 1 else ''}." + skip_note)
 
     def _export_csv(self) -> None:
-        path = filedialog.asksaveasfilename(
-            parent=self._app,
-            title="Export Passwords",
-            defaultextension=".csv",
-            filetypes=[("CSV file", "*.csv")],
-            initialfile="passwords.csv",
+        path, _ = QFileDialog.getSaveFileName(
+            self._win, "Export Passwords", "passwords.csv",
+            "CSV file (*.csv)"
         )
         if not path:
             return
         try:
-            creds = self._app.vault.get_all()
+            creds = self._win.vault.get_all()
         except VaultError:
             return
         with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["Title", "URL", "Username", "Password", "Notes", "Type"])
+            w = csv.writer(f)
+            w.writerow(["Title", "URL", "Username", "Password", "Notes",
+                        "Type", "Group", "Tab"])
             for c in creds:
-                title = c.get("app_name") or c["domain"]
-                writer.writerow([title, c["url"], c["username"], c["password"], "", c.get("cred_type", "web")])
-        messagebox.showinfo(
-            "Export complete",
-            f"Exported {len(creds)} password{'s' if len(creds) != 1 else ''} to:\n{path}\n\n"
-            "⚠  Delete the file once done — it contains your passwords in plain text.",
-            parent=self._app,
+                title     = c.get("app_name") or c["domain"]
+                cred_type = c.get("cred_type", "web")
+                type_compat = cred_type if cred_type in ("web", "app") else "web"
+                w.writerow([title, c["url"], c["username"], c["password"], "",
+                             type_compat, c.get("group_name", ""), cred_type])
+        _info_msg(self._win, "Export complete",
+                  f"Exported {len(creds)} password{'s' if len(creds) != 1 else ''} to:\n{path}\n\n"
+                  "Delete the file once done — it contains your passwords in plain text.")
+
+    def _export_json(self) -> None:
+        import datetime
+        path, _ = QFileDialog.getSaveFileName(
+            self._win, "Full Backup", "password_manager_backup.json",
+            "JSON backup (*.json)"
+        )
+        if not path:
+            return
+        try:
+            vault       = self._win.vault
+            creds       = vault.get_all()
+            custom_tabs = vault.get_custom_tabs()
+            tab_order   = vault.get_tab_order()
+            groups: list[dict] = []
+            for tab in ["web", "app"] + custom_tabs:
+                for name in vault.get_groups(tab):
+                    groups.append({"name": name, "tab": tab})
+        except VaultError:
+            return
+
+        backup = {
+            "version":     1,
+            "exported_at": datetime.datetime.now().isoformat(),
+            "custom_tabs": custom_tabs,
+            "tab_order":   tab_order,
+            "groups":      groups,
+            "credentials": [
+                {
+                    "title":    c.get("app_name") or c["domain"],
+                    "url":      c["url"],
+                    "app_name": c.get("app_name", ""),
+                    "username": c["username"],
+                    "password": c["password"],
+                    "tab":      c.get("cred_type", "web"),
+                    "group":    c.get("group_name", ""),
+                }
+                for c in creds
+            ],
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(backup, f, indent=2, ensure_ascii=False)
+
+        n_tabs = len(custom_tabs)
+        n_grps = len(groups)
+        _info_msg(
+            self._win, "Backup complete",
+            f"Backed up {len(creds)} credential{'s' if len(creds) != 1 else ''}"
+            + (f", {n_tabs} custom tab{'s' if n_tabs != 1 else ''}" if n_tabs else "")
+            + (f", and {n_grps} group{'s' if n_grps != 1 else ''}" if n_grps else "")
+            + f" to:\n{path}\n\n"
+            "Delete the file once done — it contains your passwords in plain text."
         )
 
-    def _show_transfer_menu(self) -> None:
-        menu = tk.Menu(
-            self._app, tearoff=0,
-            bg=SURFACE, fg=TEXT,
-            activebackground=ACCENT, activeforeground="#ffffff",
-            font=FONT_SM, bd=0,
+    def _import_json(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self._win, "Restore from Backup", "",
+            "JSON backup (*.json);;All files (*.*)"
         )
-        menu.add_command(label="  Import from CSV", command=self._import_csv)
-        menu.add_command(label="  Export to CSV",   command=self._export_csv)
-        menu.add_separator()
-        menu.add_command(label="  Send to Phone",   command=self._send_to_phone)
-        btn = self._transfer_btn
-        menu.tk_popup(btn.winfo_rootx(), btn.winfo_rooty() + btn.winfo_height() + 2)
+        if not path:
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                backup = json.load(f)
+        except Exception as exc:
+            _error(self._win, "Restore Failed", str(exc))
+            return
 
-    def _send_to_phone(self) -> None:
-        SendToPhoneDialog(self._app, self._app.vault)
+        if not isinstance(backup, dict) or backup.get("version") != 1:
+            _error(self._win, "Restore Failed",
+                   "This doesn't look like a valid backup file (missing version field).")
+            return
 
-    def _show_info(self) -> None:
-        InfoDialog(self._app)
+        n_creds = len(backup.get("credentials", []))
+        n_tabs  = len(backup.get("custom_tabs", []))
+        n_grps  = len(backup.get("groups", []))
 
+        detail = []
+        if n_creds: detail.append(f"  • {n_creds} credential{'s' if n_creds != 1 else ''}")
+        if n_tabs:  detail.append(f"  • {n_tabs} custom tab{'s' if n_tabs != 1 else ''}")
+        if n_grps:  detail.append(f"  • {n_grps} group{'s' if n_grps != 1 else ''}")
 
+        if not _confirm(
+            self._win, "Restore from Backup",
+            "This will add the following (existing data is NOT deleted):\n\n"
+            + "\n".join(detail or ["  (nothing to restore)"])
+            + "\n\nContinue?",
+        ):
+            return
 
-# ── Shared UI helpers ─────────────────────────────────────────────────────────
+        vault = self._win.vault
 
-def _flash_copy_btn(btn: ctk.CTkButton) -> None:
-    """Briefly show a 'Copied' state on a Copy button, then revert."""
-    try:
-        btn.configure(text="✓  Copied", fg_color=GREEN, text_color="#111827")
-        btn.after(1600, lambda: (
-            btn.configure(text="Copy", fg_color=ACCENT, text_color="#ffffff")
-            if btn.winfo_exists() else None
-        ))
-    except Exception:
-        pass
-
-
-def _bind_hover(widget: ctk.CTkFrame) -> None:
-    """Attach enter/leave highlight behaviour to a card or group widget."""
-    def enter(e):
-        prev = _hover_state["item"]
-        if prev is not None and prev is not widget:
+        for tab_name in backup.get("custom_tabs", []):
             try:
-                if prev.winfo_exists():
-                    prev.configure(fg_color=SURFACE, border_color=BORDER)
+                vault.create_custom_tab(tab_name)
             except Exception:
                 pass
-        _hover_state["item"] = widget
-        widget.configure(fg_color=SURFACE_HV, border_color=BORDER_HL)
 
-    def leave(e):
-        try:
-            wx, wy = widget.winfo_rootx(), widget.winfo_rooty()
-            ww, wh = widget.winfo_width(), widget.winfo_height()
-            if not (wx <= e.x_root <= wx + ww and wy <= e.y_root <= wy + wh):
-                widget.configure(fg_color=SURFACE, border_color=BORDER)
-                if _hover_state["item"] is widget:
-                    _hover_state["item"] = None
-        except Exception:
-            pass
+        if backup.get("tab_order"):
+            try:
+                vault.set_tab_order(backup["tab_order"])
+            except Exception:
+                pass
 
-    widget.bind("<Enter>", enter, add="+")
-    widget.bind("<Leave>", leave, add="+")
+        for g in backup.get("groups", []):
+            try:
+                vault.create_group(g["name"], g.get("tab", "web"))
+            except Exception:
+                pass
 
+        imported = skipped = 0
+        for c in backup.get("credentials", []):
+            username = c.get("username", "").strip()
+            password = c.get("password", "")
+            if not username or not password:
+                skipped += 1
+                continue
+            tab      = c.get("tab", "web")
+            group    = c.get("group", "")
+            url      = c.get("url", "")
+            app_name = c.get("app_name", "") or c.get("title", "")
+            try:
+                if tab == "web":
+                    if not url:
+                        skipped += 1
+                        continue
+                    vault.save(url, username, password, group)
+                elif tab == "app":
+                    vault.save_app(app_name or username, username, password, group)
+                else:
+                    vault.save_to_tab(app_name or c.get("title", ""),
+                                      username, password, tab, group)
+                imported += 1
+            except Exception:
+                skipped += 1
 
-def _make_cred_actions(parent, on_edit, on_delete, cred) -> tuple:
-    """Build the Edit/Delete buttons and an unconfigured Copy button; returns (frame, copy_btn)."""
-    acts = ctk.CTkFrame(parent, fg_color="transparent")
-    copy_btn = ctk.CTkButton(
-        acts, text="Copy", width=66, height=32, font=FONT_SM, corner_radius=7,
-        fg_color=ACCENT, hover_color=ACCENT_HV, text_color="#ffffff",
-    )
-    copy_btn.pack(side="left", padx=(0, 5))
-    ctk.CTkButton(
-        acts, text="Edit", width=54, height=32, font=FONT_SM, corner_radius=7,
-        fg_color="transparent", border_width=1, border_color=BORDER,
-        hover_color=SURFACE_HV, text_color=TEXT2,
-        command=lambda: on_edit(cred),
-    ).pack(side="left", padx=(0, 5))
-    ctk.CTkButton(
-        acts, text="✕", width=32, height=32, font=FONT_SM, corner_radius=7,
-        fg_color="transparent", border_width=1, border_color=DANGER,
-        hover_color="#2a0a0a", text_color=DANGER,
-        command=lambda: on_delete(cred),
-    ).pack(side="left")
-    return acts, copy_btn
+        self._refresh()
+        skip_note = (f"\nSkipped {skipped} item{'s' if skipped != 1 else ''} "
+                     "(missing required fields).") if skipped else ""
+        _info_msg(self._win, "Restore Complete",
+                  f"Restored {imported} credential{'s' if imported != 1 else ''}."
+                  + skip_note)
+
+    def _send_to_phone(self) -> None:
+        SendToPhoneDialog(self._win, self._win.vault).exec()
+
+    def _show_info(self) -> None:
+        InfoDialog(self._win).exec()
+
+    def _open_generator(self) -> None:
+        GeneratorDialog(self._win).exec()
 
 
 # ── Base dialog ────────────────────────────────────────────────────────────────
 
-class _BaseDialog(ctk.CTkToplevel):
-    """Common scaffolding shared by all modal dialogs."""
-
-    def __init__(self, parent, title: str, size: str | None = None) -> None:
+class BaseDialog(QDialog):
+    def __init__(self, parent, title: str, width: int = 460, height: int = 500) -> None:
         super().__init__(parent)
-        self.configure(fg_color=BG)
-        self.title(title)
-        if size is not None:
-            self.geometry(size)
-        self.resizable(False, False)
-        self.transient(parent)
-        self.after(60, lambda: (self.lift(), self.grab_set(), self._center()))
-        self.after(200, lambda: _apply_icon(self))
-
-    def _center(self) -> None:
-        self.update_idletasks()
-        px = self.master.winfo_rootx() + self.master.winfo_width() // 2
-        py = self.master.winfo_rooty() + self.master.winfo_height() // 2
-        self.geometry(f"+{px - self.winfo_width() // 2}+{py - self.winfo_height() // 2}")
-
-
-# ── Credential card (single entry) ────────────────────────────────────────────
-
-class CredentialCard(ctk.CTkFrame):
-    def __init__(self, parent, cred: dict, on_copy, on_edit, on_delete,
-                 avatar_variant: int = 0, **kw):
-        super().__init__(
-            parent,
-            fg_color=SURFACE, border_width=1, border_color=BORDER,
-            corner_radius=10, **kw,
+        self.setWindowTitle(title)
+        self.setFixedSize(width, height)
+        self.setWindowFlags(
+            Qt.WindowType.Dialog | Qt.WindowType.WindowCloseButtonHint
         )
-        self._cred           = cred
-        self._copy_btn       = None
-        self._avatar_variant = avatar_variant
-        self._build(on_copy, on_edit, on_delete)
+        self._outer = QVBoxLayout(self)
+        self._outer.setContentsMargins(0, 0, 0, 0)
+        self._outer.setSpacing(0)
+        if parent:
+            self._center_on_parent()
 
-    def _build(self, on_copy, on_edit, on_delete) -> None:
-        pad = ctk.CTkFrame(self, fg_color="transparent")
-        pad.pack(fill="x", padx=14, pady=11)
+    def _center_on_parent(self) -> None:
+        if p := self.parent():
+            pg = p.frameGeometry()
+            self.move(
+                pg.center().x() - self.width() // 2,
+                pg.center().y() - self.height() // 2,
+            )
 
-        label = self._cred.get("app_name") or self._cred["domain"]
-        av = ctk.CTkFrame(pad, width=44, height=44, corner_radius=10,
-                          fg_color=_avatar_color(label, self._avatar_variant))
-        av.pack(side="left", padx=(0, 14))
-        av.pack_propagate(False)
-        ctk.CTkLabel(av, text=_initial(label),
-                     font=("Segoe UI", 17, "bold"), text_color="#ffffff").pack(expand=True)
+    def _header(self, text: str, height: int = 54) -> QWidget:
+        hdr = QWidget()
+        hdr.setFixedHeight(height)
+        hl = QHBoxLayout(hdr)
+        hl.setContentsMargins(20, 0, 20, 0)
+        hl.addWidget(QLabel(text))
+        self._outer.addWidget(hdr)
+        self._outer.addWidget(_separator())
+        return hdr
 
-        info = ctk.CTkFrame(pad, fg_color="transparent")
-        info.pack(side="left", fill="x", expand=True)
-        ctk.CTkLabel(info, text=label, font=FONT_BOLD, text_color=TEXT, anchor="w").pack(fill="x")
-        ctk.CTkLabel(info, text=self._cred["username"],
-                     font=FONT_SM, text_color=TEXT2, anchor="w").pack(fill="x")
+    def _body_widget(self) -> QWidget:
+        body = QWidget()
+        self._outer.addWidget(body, 1)
+        return body
 
-        acts, self._copy_btn = _make_cred_actions(pad, on_edit, on_delete, self._cred)
-        self._copy_btn.configure(command=lambda: on_copy(self._cred, self))
-        acts.pack(side="right", padx=(10, 0))
+    def _field(self, parent_layout: QVBoxLayout, placeholder: str,
+               password: bool = False) -> QLineEdit:
+        e = QLineEdit()
+        e.setPlaceholderText(placeholder)
+        e.setFixedHeight(40)
+        if password:
+            e.setEchoMode(QLineEdit.EchoMode.Password)
+        parent_layout.addWidget(e)
+        return e
 
-        _bind_hover(self)
-
-    def flash_copied(self) -> None:
-        if self._copy_btn:
-            _flash_copy_btn(self._copy_btn)
-
-
-
-# ── Credential group (collapsible multi-login) ────────────────────────────────
-
-class CredentialGroup(ctk.CTkFrame):
-    """Collapsible group card for multiple credentials sharing the same domain/app."""
-
-    def __init__(
-        self, parent,
-        display_name: str,
-        group_key: str,
-        creds: list,
-        collapsed: bool,
-        on_toggle,
-        on_copy,
-        on_edit,
-        on_delete,
-        avatar_variant: int = 0,
-        on_register_drop=None,
-        is_manual: bool = False,
-        on_delete_group=None,
-        **kw,
-    ):
-        super().__init__(
-            parent,
-            fg_color=SURFACE, border_width=1, border_color=BORDER,
-            corner_radius=10, **kw,
-        )
-        self._display          = display_name
-        self._key              = group_key
-        self._creds            = creds
-        self._collapsed        = collapsed
-        self._on_toggle        = on_toggle
-        self._on_copy          = on_copy
-        self._on_edit          = on_edit
-        self._on_delete        = on_delete
-        self._avatar_variant   = avatar_variant
-        self._on_register_drop = on_register_drop
-        self._is_manual        = is_manual
-        self._on_delete_group  = on_delete_group
-        self._body_built       = False
-        self._build()
-
-    def _build(self) -> None:
-        # ── Group header ──
-        hdr = ctk.CTkFrame(self, fg_color="transparent")
-        hdr.pack(fill="x", padx=14, pady=(10, 10))
-        if self._on_register_drop:
-            self.after(150, lambda: self._on_register_drop(self._key, self))
-
-        av = ctk.CTkFrame(hdr, width=44, height=44, corner_radius=10,
-                          fg_color=_avatar_color(self._display, self._avatar_variant))
-        av.pack(side="left", padx=(0, 14))
-        av.pack_propagate(False)
-        av_lbl = ctk.CTkLabel(av, text=_initial(self._display),
-                     font=("Segoe UI", 17, "bold"), text_color="#ffffff")
-        av_lbl.pack(expand=True)
-
-        info = ctk.CTkFrame(hdr, fg_color="transparent")
-        info.pack(side="left", fill="x", expand=True)
-        info_title = ctk.CTkLabel(info, text=self._display,
-                                   font=FONT_BOLD, text_color=TEXT, anchor="w")
-        info_title.pack(fill="x")
-        n = len(self._creds)
-        count_text = "Empty — drag a login here" if n == 0 else f"{n} login{'s' if n != 1 else ''}"
-        info_sub = ctk.CTkLabel(info, text=count_text,
-                     font=FONT_SM, text_color=TEXT2, anchor="w")
-        info_sub.pack(fill="x")
-
-        if self._is_manual and self._on_delete_group:
-            ctk.CTkButton(
-                hdr, text="✕", width=32, height=32, font=FONT_SM, corner_radius=7,
-                fg_color="transparent", border_width=1, border_color=DANGER,
-                hover_color="#2a0a0a", text_color=DANGER,
-                command=lambda: self._on_delete_group(self._key),
-            ).pack(side="right")
-
-        self._chevron = ctk.CTkButton(
-            hdr,
-            text="▲" if not self._collapsed else "▼",
-            width=32, height=32, font=FONT_SM, corner_radius=7,
-            fg_color="transparent", border_width=1, border_color=BORDER,
-            hover_color=SURFACE_HV, text_color=TEXT2,
-            command=self._toggle,
-        )
-        self._chevron.pack(side="right", padx=(0, 6) if (self._is_manual and self._on_delete_group) else 0)
-
-        # Clicking anywhere on the header (outside the action buttons) toggles the group.
-        for w in (hdr, av, av_lbl, info, info_title, info_sub):
-            w.bind("<ButtonRelease-1>", lambda e: self._toggle(), add="+")
-            try:
-                w.configure(cursor="hand2")
-            except Exception:
-                pass
-
-        _bind_hover(self)
-
-        # ── Separator + body ──
-        self._sep  = ctk.CTkFrame(self, height=1, fg_color=BORDER, corner_radius=0)
-        self._body = ctk.CTkFrame(self, fg_color="transparent")
-
-        if not self._collapsed:
-            self._sep.pack(fill="x")
-            self._body.pack(fill="x")
-            self._build_body()
-            self._body_built = True
-
-    def _build_body(self) -> None:
-        if not self._creds:
-            ctk.CTkLabel(
-                self._body,
-                text="Drag a credential here to add it to this group",
-                font=FONT_SM, text_color=TEXT2, justify="center",
-            ).pack(pady=16)
-            return
-        for i, cred in enumerate(self._creds):
-            last = i == len(self._creds) - 1
-
-            row = ctk.CTkFrame(self._body, fg_color="transparent")
-            row.pack(fill="x", pady=(8 if i == 0 else 2, 8 if last else 2))
-            row._drag_cred_tag = cred  # picked up by MainFrame._find_drag_cred
-
-            # Fixed-size accent indent bar — no fill="y" to avoid height inflation
-            accent = ctk.CTkFrame(row, width=3, height=28, fg_color=ACCENT, corner_radius=2)
-            accent.pack_propagate(False)
-            accent.pack(side="left", padx=(32, 0))
-
-            info = ctk.CTkFrame(row, fg_color="transparent")
-            info.pack(side="left", fill="x", expand=True, padx=(10, 0))
-            ctk.CTkLabel(
-                info, text=cred["username"], font=FONT, text_color=TEXT, anchor="w",
-            ).pack(fill="x")
-
-            acts, copy_btn = _make_cred_actions(row, self._on_edit, self._on_delete, cred)
-            copy_btn.configure(command=lambda c=cred, b=copy_btn: self._copy_cred(c, b))
-            acts.pack(side="right", padx=(0, 14))
-
-    def _copy_cred(self, cred: dict, btn: ctk.CTkButton) -> None:
-        self._on_copy(cred, None)
-        _flash_copy_btn(btn)
-
-    def _toggle(self) -> None:
-        self._collapsed = not self._collapsed
-        self._on_toggle(self._key, self._collapsed)
-        self._chevron.configure(text="▼" if self._collapsed else "▲")
-        if self._collapsed:
-            self._sep.pack_forget()
-            self._body.pack_forget()
-        else:
-            if not self._body_built:
-                self._build_body()
-                self._body_built = True
-            self._sep.pack(fill="x")
-            self._body.pack(fill="x")
+    def _labeled_field(self, parent_layout: QVBoxLayout, label: str,
+                        placeholder: str, password: bool = False) -> QLineEdit:
+        parent_layout.addWidget(QLabel(label))
+        e = self._field(parent_layout, placeholder, password)
+        parent_layout.addSpacing(4)
+        return e
 
 
-# ── Add / Edit dialog ─────────────────────────────────────────────────────────
+# ── Add/Edit dialog ────────────────────────────────────────────────────────────
 
-class CredentialDialog(_BaseDialog):
-    def __init__(self, parent: App, on_save, existing: dict | None = None,
+class CredentialDialog(BaseDialog):
+    def __init__(self, parent, on_save, existing: dict | None = None,
                  existing_groups: list | None = None,
-                 preset_group: str = "",
                  custom_tabs: list | None = None,
                  preset_type: str | None = None) -> None:
-        super().__init__(
-            parent,
-            "Edit Credential" if existing else "Add Credential",
-            "460x565" if existing else "460x520",
-        )
+        h = 580 if existing else 530
+        super().__init__(parent, "Edit Credential" if existing else "Add Credential",
+                         460, h)
         self._on_save         = on_save
         self._existing        = existing
         self._existing_groups = existing_groups or []
-        self._preset_group    = preset_group
         self._custom_tabs     = custom_tabs or []
         self._preset_type     = preset_type
         self._build()
-
-        if existing:
-            cred_type = existing.get("cred_type", "web")
-            if cred_type == "web":
-                self._type_var.set("Website")
-                self._set_type("Website")
-                # If the credential has no URL (e.g. moved from a custom tab),
-                # fall back to app_name so the field isn't confusingly blank.
-                url_val = existing.get("url") or existing.get("app_name", "")
-                self._url_e.insert(0, url_val)
-            elif cred_type == "app":
-                self._type_var.set("App")
-                self._set_type("App")
-                self._app_e.insert(0, existing.get("app_name", ""))
-            else:
-                self._type_var.set(cred_type)
-                self._set_type(cred_type)
-                self._app_e.insert(0, existing.get("app_name", ""))
-            self._user_e.insert(0, existing.get("username", ""))
-            self._pw_e.insert(0, existing.get("password", ""))
-            grp = existing.get("group_name", "")
-            self._group_combo.set(grp if grp else "(none)")
-            self._type_menu.configure(state="disabled")
-
-        if self._preset_group:
-            self._group_combo.set(self._preset_group)
-
-        if not existing and self._preset_type:
-            self._type_var.set(self._preset_type)
-            self._set_type(self._preset_type)
-
-        ct = existing.get("cred_type", "web") if existing else None
-        active_e = self._app_e if (ct and ct != "web") else self._url_e
-        self.after(80, active_e.focus_set)
+        self._populate()
 
     def _build(self) -> None:
-        hdr = ctk.CTkFrame(self, height=54, fg_color=HEADER_BG, corner_radius=0)
-        hdr.pack(fill="x")
-        hdr.pack_propagate(False)
-        ctk.CTkLabel(
-            hdr,
-            text="Edit Credential" if self._existing else "New Credential",
-            font=FONT_BOLD, text_color=TEXT,
-        ).pack(side="left", padx=20, pady=16)
+        self._header("Edit Credential" if self._existing else "New Credential")
+        body = self._body_widget()
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(22, 14, 22, 14)
+        bl.setSpacing(6)
 
-        body = ctk.CTkFrame(self, fg_color=BG)
-        body.pack(fill="both", expand=True, padx=22, pady=14)
+        type_row = QHBoxLayout()
+        type_row.setSpacing(8)
+        type_row.addWidget(QLabel("Type"))
+        self._type_combo = QComboBox()
+        self._type_combo.addItems(["Website", "App"] + self._custom_tabs)
+        self._type_combo.setFixedHeight(36)
+        self._type_combo.currentTextChanged.connect(self._set_type)
+        type_row.addWidget(self._type_combo, 1)
+        bl.addLayout(type_row)
+        bl.addSpacing(4)
 
-        # Type selector
-        type_row = ctk.CTkFrame(body, fg_color="transparent")
-        type_row.pack(fill="x", pady=(0, 10))
-        ctk.CTkLabel(type_row, text="Type", font=FONT_SM, text_color=TEXT2,
-                     width=80, anchor="w").pack(side="left")
-        all_types = ["Website", "App"] + self._custom_tabs
-        self._type_var = tk.StringVar(value="Website")
-        self._type_menu = ctk.CTkOptionMenu(
-            type_row, values=all_types,
-            variable=self._type_var,
-            font=FONT_SM, height=36,
-            fg_color=SURFACE, button_color=BORDER,
-            button_hover_color=SURFACE_HV, text_color=TEXT,
-            dropdown_fg_color=SURFACE, dropdown_text_color=TEXT,
-            dropdown_hover_color=SURFACE_HV,
-            command=self._set_type,
+        self._id_label = QLabel("URL")
+        bl.addWidget(self._id_label)
+
+        self._url_entry = QLineEdit()
+        self._url_entry.setPlaceholderText("https://github.com")
+        self._url_entry.setFixedHeight(40)
+        bl.addWidget(self._url_entry)
+
+        self._app_entry = QLineEdit()
+        self._app_entry.setPlaceholderText("Discord, Slack, Steam…")
+        self._app_entry.setFixedHeight(40)
+        self._app_entry.hide()
+        bl.addWidget(self._app_entry)
+
+        self._app_hint = QLabel(
+            f"Enter the app's window title exactly (e.g. 'Discord', 'Slack').\n"
+            f"{_get_hotkey_label()} will autofill when that window is active."
         )
-        self._type_menu.pack(side="left", fill="x", expand=True)
+        self._app_hint.setWordWrap(True)
+        self._app_hint.hide()
+        bl.addWidget(self._app_hint)
+        bl.addSpacing(2)
 
-        # Label + swappable entry container (URL ↔ App Name)
-        self._url_label = ctk.CTkLabel(body, text="URL", font=FONT_SM, text_color=TEXT2, anchor="w")
-        self._url_label.pack(fill="x", pady=(0, 2))
+        bl.addWidget(QLabel("Username / Email"))
+        self._user_entry = QLineEdit()
+        self._user_entry.setPlaceholderText("Username / Email")
+        self._user_entry.setFixedHeight(40)
+        bl.addWidget(self._user_entry)
+        bl.addSpacing(2)
 
-        # Container holds exactly one entry at a time; _set_type swaps them
-        self._id_frame = ctk.CTkFrame(body, fg_color="transparent")
-        self._id_frame.pack(fill="x", pady=(0, 2))
+        bl.addWidget(QLabel("Password"))
+        pw_row = QHBoxLayout()
+        pw_row.setSpacing(6)
+        self._pw_entry = QLineEdit()
+        self._pw_entry.setPlaceholderText("Password")
+        self._pw_entry.setEchoMode(QLineEdit.EchoMode.Password)
+        self._pw_entry.setFixedHeight(40)
+        pw_row.addWidget(self._pw_entry, 1)
+        self._eye_btn = _btn("Show")
+        self._eye_btn.setFixedHeight(40)
+        self._eye_btn.clicked.connect(self._toggle_pw)
+        pw_row.addWidget(self._eye_btn)
+        bl.addLayout(pw_row)
 
-        self._url_e = ctk.CTkEntry(
-            self._id_frame, placeholder_text="https://github.com",
-            height=40, font=FONT,
-            fg_color=INPUT_BG, border_color=BORDER,
-            border_width=1, corner_radius=8, text_color=TEXT,
-        )
-        self._url_e.pack(fill="x")   # visible by default (Website type)
+        self._err_lbl = QLabel("")
+        bl.addWidget(self._err_lbl)
 
-        self._app_e = ctk.CTkEntry(
-            self._id_frame, placeholder_text="Discord, Slack, Steam…",
-            height=40, font=FONT,
-            fg_color=INPUT_BG, border_color=BORDER,
-            border_width=1, corner_radius=8, text_color=TEXT,
-        )
-        # NOT packed yet — shown only when type = App
-
-        self._app_hint = ctk.CTkLabel(
-            body,
-            text="Enter the app's window title exactly (e.g. 'Discord', 'Slack').\n"
-                 f"{_get_hotkey_label()} will autofill when that window is active.",
-            font=("Segoe UI", 10), text_color=TEXT2,
-            wraplength=380, justify="left",
-        )
-        # NOT packed yet — shown only when type = App
-
-        self._user_e = self._field(body, "Username / Email")
-
-        pw_row = ctk.CTkFrame(body, fg_color="transparent")
-        pw_row.pack(fill="x", pady=(0, 4))
-
-        self._pw_e = ctk.CTkEntry(
-            pw_row, placeholder_text="Password",
-            height=40, font=FONT, show="•",
-            fg_color=INPUT_BG, border_color=BORDER,
-            border_width=1, corner_radius=8, text_color=TEXT,
-        )
-        self._pw_e.pack(side="left", fill="x", expand=True)
-
-        self._eye = ctk.CTkButton(
-            pw_row, text="Show", width=60, height=40, font=FONT_SM, corner_radius=8,
-            fg_color="transparent", border_width=1, border_color=BORDER,
-            hover_color=SURFACE, text_color=TEXT2,
-            command=self._toggle_pw,
-        )
-        self._eye.pack(side="left", padx=(6, 0))
-
-        self._err = ctk.CTkLabel(body, text="", text_color=DANGER, font=FONT_SM)
-        self._err.pack(anchor="w", pady=(2, 0))
-
-        # Tab (only shown when editing — lets the user move the credential to any tab)
-        self._tab_move_var: tk.StringVar | None = None
         if self._existing:
             ct = self._existing.get("cred_type", "web")
-            tab_options = ["Websites", "Apps"] + self._custom_tabs
             current_tab = {"web": "Websites", "app": "Apps"}.get(ct, ct)
+            tab_row = QHBoxLayout()
+            tab_row.setSpacing(8)
+            tab_row.addWidget(QLabel("Tab"))
+            self._tab_combo = QComboBox()
+            self._tab_combo.addItems(["Websites", "Apps"] + self._custom_tabs)
+            self._tab_combo.setCurrentText(current_tab)
+            self._tab_combo.setFixedHeight(40)
+            tab_row.addWidget(self._tab_combo, 1)
+            bl.addLayout(tab_row)
+            bl.addSpacing(4)
+        else:
+            self._tab_combo = None
 
-            tab_row = ctk.CTkFrame(body, fg_color="transparent")
-            tab_row.pack(fill="x", pady=(8, 0))
-            ctk.CTkLabel(tab_row, text="Tab", font=FONT_SM, text_color=TEXT2,
-                         anchor="w", width=80).pack(side="left")
-            self._tab_move_var = tk.StringVar(value=current_tab)
-            ctk.CTkOptionMenu(
-                tab_row, values=tab_options,
-                variable=self._tab_move_var,
-                font=FONT_SM, height=40,
-                fg_color=INPUT_BG, button_color=BORDER,
-                button_hover_color=SURFACE_HV, text_color=TEXT,
-                dropdown_fg_color=SURFACE, dropdown_text_color=TEXT,
-                dropdown_hover_color=SURFACE_HV,
-            ).pack(side="left", fill="x", expand=True)
+        group_row = QHBoxLayout()
+        group_row.setSpacing(8)
+        group_row.addWidget(QLabel("Group"))
+        self._group_combo = QComboBox()
+        self._group_combo.setEditable(True)
+        self._group_combo.addItem("(none)")
+        for g in self._existing_groups:
+            self._group_combo.addItem(g)
+        self._group_combo.setCurrentText("(none)")
+        self._group_combo.setFixedHeight(40)
+        group_row.addWidget(self._group_combo, 1)
+        bl.addLayout(group_row)
 
-        # Group
-        group_row = ctk.CTkFrame(body, fg_color="transparent")
-        group_row.pack(fill="x", pady=(8, 0))
-        ctk.CTkLabel(group_row, text="Group", font=FONT_SM, text_color=TEXT2,
-                     anchor="w", width=80).pack(side="left")
-        combo_values = ["(none)"] + self._existing_groups
-        self._group_combo = ctk.CTkComboBox(
-            group_row, values=combo_values,
-            height=40, font=FONT,
-            fg_color=INPUT_BG, border_color=BORDER,
-            border_width=1, corner_radius=8,
-            text_color=TEXT,
-            button_color=BORDER, button_hover_color=SURFACE_HV,
-            dropdown_fg_color=SURFACE, dropdown_text_color=TEXT,
-            dropdown_hover_color=SURFACE_HV,
-        )
-        self._group_combo.set("(none)")
-        self._group_combo.pack(side="left", fill="x", expand=True)
+        bl.addStretch(1)
 
-        btn_row = ctk.CTkFrame(body, fg_color="transparent")
-        btn_row.pack(fill="x", pady=(10, 0))
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        cancel = _btn("Cancel")
+        cancel.setFixedSize(120, 40)
+        cancel.clicked.connect(self.reject)
+        btn_row.addWidget(cancel)
+        btn_row.addStretch(1)
+        save = _btn("Save")
+        save.setFixedSize(120, 40)
+        save.clicked.connect(self._submit)
+        btn_row.addWidget(save)
+        bl.addLayout(btn_row)
 
-        ctk.CTkButton(
-            btn_row, text="Cancel", width=120, height=40, font=FONT,
-            fg_color="transparent", border_width=1, border_color=BORDER,
-            hover_color=SURFACE, text_color=TEXT2,
-            command=self.destroy,
-        ).pack(side="left")
-
-        ctk.CTkButton(
-            btn_row, text="Save", width=120, height=40, font=FONT_BOLD,
-            fg_color=ACCENT, hover_color=ACCENT_HV,
-            command=self._submit,
-        ).pack(side="right")
+    def _populate(self) -> None:
+        ex = self._existing
+        if ex:
+            ct = ex.get("cred_type", "web")
+            if ct == "web":
+                self._type_combo.setCurrentText("Website")
+                self._set_type("Website")
+                self._url_entry.setText(ex.get("url") or ex.get("app_name", ""))
+            elif ct == "app":
+                self._type_combo.setCurrentText("App")
+                self._set_type("App")
+                self._app_entry.setText(ex.get("app_name", ""))
+            else:
+                self._type_combo.setCurrentText(ct)
+                self._set_type(ct)
+                self._app_entry.setText(ex.get("app_name", ""))
+            self._user_entry.setText(ex.get("username", ""))
+            self._pw_entry.setText(ex.get("password", ""))
+            grp = ex.get("group_name", "")
+            self._group_combo.setCurrentText(grp if grp else "(none)")
+            self._type_combo.setEnabled(False)
+        elif self._preset_type:
+            self._type_combo.setCurrentText(self._preset_type)
+            self._set_type(self._preset_type)
+        QTimer.singleShot(80, lambda: (
+            self._app_entry.setFocus()
+            if (ex and ex.get("cred_type", "web") != "web") else
+            self._url_entry.setFocus()
+        ))
 
     def _set_type(self, value: str) -> None:
         if value == "Website":
-            self._url_label.configure(text="URL")
-            self._app_e.pack_forget()
-            self._app_hint.pack_forget()
-            self._url_e.pack(fill="x")
+            self._id_label.setText("URL")
+            self._app_entry.hide()
+            self._app_hint.hide()
+            self._url_entry.show()
         else:
             field_label = "App Name" if value == "App" else "Label"
             placeholder = "Discord, Slack, Steam…" if value == "App" else "e.g. Netflix, Bank…"
-            self._url_label.configure(text=field_label)
-            self._url_e.pack_forget()
-            self._app_e.configure(placeholder_text=placeholder)
-            self._app_e.pack(fill="x")
+            self._id_label.setText(field_label)
+            self._url_entry.hide()
+            self._app_entry.setPlaceholderText(placeholder)
+            self._app_entry.show()
             if value == "App":
-                self._app_hint.pack(fill="x", pady=(0, 6))
+                self._app_hint.show()
             else:
-                self._app_hint.pack_forget()
-
-    def _field(self, parent, placeholder: str) -> ctk.CTkEntry:
-        e = ctk.CTkEntry(
-            parent, placeholder_text=placeholder,
-            height=40, font=FONT,
-            fg_color=INPUT_BG, border_color=BORDER,
-            border_width=1, corner_radius=8, text_color=TEXT,
-        )
-        e.pack(fill="x", pady=(0, 6))
-        return e
+                self._app_hint.hide()
 
     def _toggle_pw(self) -> None:
-        hidden = self._pw_e.cget("show") == "•"
-        self._pw_e.configure(show="" if hidden else "•")
-        self._eye.configure(text="Hide" if hidden else "Show")
+        hidden = self._pw_entry.echoMode() == QLineEdit.EchoMode.Password
+        self._pw_entry.setEchoMode(
+            QLineEdit.EchoMode.Normal if hidden else QLineEdit.EchoMode.Password
+        )
+        self._eye_btn.setText("Hide" if hidden else "Show")
 
     def _submit(self) -> None:
-        if self._existing:
-            cred_type = self._existing.get("cred_type", "web")
+        ex = self._existing
+        if ex:
+            cred_type = ex.get("cred_type", "web")
         else:
-            type_val  = self._type_var.get()
+            type_val  = self._type_combo.currentText()
             cred_type = {"Website": "web", "App": "app"}.get(type_val, type_val)
 
-        identifier = (self._url_e if cred_type == "web" else self._app_e).get().strip()
-        user = self._user_e.get().strip()
-        pw   = self._pw_e.get()
+        identifier = (
+            self._url_entry.text().strip()
+            if cred_type == "web" else
+            self._app_entry.text().strip()
+        )
+        user = self._user_entry.text().strip()
+        pw   = self._pw_entry.text()
 
-        if not identifier and not self._existing:
+        if not identifier and not ex:
             msgs = {"web": "URL is required.", "app": "App name is required."}
-            self._err.configure(text=msgs.get(cred_type, "Label is required."))
+            self._err_lbl.setText(msgs.get(cred_type, "Label is required."))
             return
         if not user:
-            self._err.configure(text="Username is required.")
+            self._err_lbl.setText("Username is required.")
             return
         if not pw:
-            self._err.configure(text="Password is required.")
+            self._err_lbl.setText("Password is required.")
             return
 
-        raw_group  = self._group_combo.get().strip()
+        raw_group  = self._group_combo.currentText().strip()
         group_name = "" if raw_group == "(none)" else raw_group
 
-        # Determine target tab (may differ from cred_type when editing)
-        if self._tab_move_var is not None:
-            tab_label  = self._tab_move_var.get()
+        if self._tab_combo is not None:
+            tab_label  = self._tab_combo.currentText()
             target_tab = {"Websites": "web", "Apps": "app"}.get(tab_label, tab_label)
         else:
             target_tab = cred_type
 
         self._on_save({
-            "cred_type":  cred_type,   # source type (determines which field holds identifier)
-            "target_tab": target_tab,  # where the credential should live after save
+            "cred_type":  cred_type,
+            "target_tab": target_tab,
             "url":        identifier if cred_type == "web" else "",
             "app_name":   identifier if cred_type != "web" else "",
             "group_name": group_name,
             "username":   user,
             "password":   pw,
         })
-        self.destroy()
+        self.accept()
 
 
-# ── New-group dialog ──────────────────────────────────────────────────────────
+# ── Group / Tab name dialog ────────────────────────────────────────────────────
 
-class GroupNameDialog(_BaseDialog):
-    """Prompts for a name (group or tab), then hands it back via on_create."""
-
-    def __init__(self, parent: App, on_create,
+class GroupNameDialog(BaseDialog):
+    def __init__(self, parent, on_create,
                  title: str = "New Group",
                  header: str = "New Group",
                  placeholder: str = "e.g. Gaming, Work, Social…") -> None:
-        super().__init__(parent, title, "360x230")
+        super().__init__(parent, title, 360, 230)
         self._on_create   = on_create
-        self._header      = header
+        self._header_text = header
         self._placeholder = placeholder
         self._build()
 
     def _build(self) -> None:
-        hdr = ctk.CTkFrame(self, height=48, fg_color=HEADER_BG, corner_radius=0)
-        hdr.pack(fill="x")
-        hdr.pack_propagate(False)
-        ctk.CTkLabel(hdr, text=self._header, font=FONT_BOLD, text_color=TEXT).pack(
-            side="left", padx=20
-        )
+        self._header(self._header_text)
+        body = self._body_widget()
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(22, 14, 22, 14)
+        bl.setSpacing(6)
 
-        body = ctk.CTkFrame(self, fg_color=BG)
-        body.pack(fill="both", expand=True, padx=22, pady=14)
+        label_text = "Tab Name" if "Tab" in self._header_text else "Group Name"
+        bl.addWidget(QLabel(label_text))
+        self._name_entry = QLineEdit()
+        self._name_entry.setPlaceholderText(self._placeholder)
+        self._name_entry.setFixedHeight(40)
+        bl.addWidget(self._name_entry)
 
-        label_text = "Tab Name" if "Tab" in self._header else "Group Name"
-        ctk.CTkLabel(body, text=label_text, font=FONT_SM, text_color=TEXT2,
-                     anchor="w").pack(fill="x", pady=(0, 4))
-        self._name_e = ctk.CTkEntry(
-            body, placeholder_text=self._placeholder,
-            height=40, font=FONT,
-            fg_color=INPUT_BG, border_color=BORDER,
-            border_width=1, corner_radius=8, text_color=TEXT,
-        )
-        self._name_e.pack(fill="x")
+        self._err_lbl = QLabel("")
+        bl.addWidget(self._err_lbl)
+        bl.addStretch(1)
 
-        self._err = ctk.CTkLabel(body, text="", text_color=DANGER, font=FONT_SM)
-        self._err.pack(anchor="w", pady=(4, 0))
+        btn_row = QHBoxLayout()
+        cancel = _btn("Cancel")
+        cancel.setFixedSize(100, 36)
+        cancel.clicked.connect(self.reject)
+        btn_row.addWidget(cancel)
+        btn_row.addStretch(1)
+        create = _btn("Create")
+        create.setFixedSize(100, 36)
+        create.clicked.connect(self._submit)
+        btn_row.addWidget(create)
+        bl.addLayout(btn_row)
 
-        btn_row = ctk.CTkFrame(body, fg_color="transparent")
-        btn_row.pack(fill="x", pady=(8, 0))
-        ctk.CTkButton(
-            btn_row, text="Cancel", width=100, height=36, font=FONT,
-            fg_color="transparent", border_width=1, border_color=BORDER,
-            hover_color=SURFACE, text_color=TEXT2, command=self.destroy,
-        ).pack(side="left")
-        ctk.CTkButton(
-            btn_row, text="Create", width=100, height=36, font=FONT_BOLD,
-            fg_color=ACCENT, hover_color=ACCENT_HV, command=self._submit,
-        ).pack(side="right")
-
-        self.after(80, self._name_e.focus_set)
-        self.bind("<Return>", lambda _: self._submit())
+        QTimer.singleShot(80, self._name_entry.setFocus)
+        self._name_entry.returnPressed.connect(self._submit)
 
     def _submit(self) -> None:
-        name = self._name_e.get().strip()
+        name = self._name_entry.text().strip()
         if not name:
-            self._err.configure(text="Name is required.")
+            self._err_lbl.setText("Name is required.")
             return
         self._on_create(name)
-        self.destroy()
+        self.accept()
 
 
-# ── Password generator dialog ─────────────────────────────────────────────────
+# ── Password generator ─────────────────────────────────────────────────────────
 
-class GeneratorDialog(_BaseDialog):
-    def __init__(self, parent: App) -> None:
-        super().__init__(parent, "Password Generator", "440x490")
+class GeneratorDialog(BaseDialog):
+    def __init__(self, parent) -> None:
+        super().__init__(parent, "Password Generator", 440, 490)
         self._build()
 
     def _build(self) -> None:
-        hdr = ctk.CTkFrame(self, height=52, fg_color=HEADER_BG, corner_radius=0)
-        hdr.pack(fill="x")
-        hdr.pack_propagate(False)
-        ctk.CTkLabel(hdr, text="Password Generator", font=FONT_BOLD, text_color=TEXT).pack(
-            side="left", padx=20
-        )
+        self._header("Password Generator")
+        body = self._body_widget()
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(28, 20, 28, 20)
+        bl.setSpacing(10)
 
-        body = ctk.CTkFrame(self, fg_color=BG)
-        body.pack(fill="both", expand=True, padx=28, pady=20)
+        out_row = QHBoxLayout()
+        self._output = QLineEdit()
+        self._output.setPlaceholderText("Click Generate…")
+        self._output.setFixedHeight(46)
+        self._output.setReadOnly(True)
+        out_row.addWidget(self._output, 1)
+        copy_btn = _btn("Copy")
+        copy_btn.setFixedHeight(46)
+        copy_btn.clicked.connect(self._copy)
+        out_row.addWidget(copy_btn)
+        bl.addLayout(out_row)
 
-        out_row = ctk.CTkFrame(body, fg_color="transparent")
-        out_row.pack(fill="x")
-        self._output = ctk.CTkEntry(
-            out_row, placeholder_text="Click Generate…",
-            height=46, font=("Consolas", 13),
-            fg_color=INPUT_BG, border_color=BORDER,
-            border_width=1, corner_radius=8, text_color=TEXT,
-        )
-        self._output.pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(
-            out_row, text="Copy", width=80, height=46, font=FONT_SM, corner_radius=8,
-            fg_color="transparent", border_width=1, border_color=BORDER,
-            hover_color=SURFACE, text_color=TEXT2,
-            command=self._copy,
-        ).pack(side="left", padx=(10, 0))
+        self._copied_lbl = QLabel("")
+        self._copied_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+        bl.addWidget(self._copied_lbl)
 
-        self._copied_lbl = ctk.CTkLabel(body, text="", font=FONT_SM, text_color=GREEN)
-        self._copied_lbl.pack(anchor="e", pady=(4, 12))
+        len_row = QHBoxLayout()
+        len_row.addWidget(QLabel("Length"))
+        self._len_slider = QSlider(Qt.Orientation.Horizontal)
+        self._len_slider.setRange(8, 32)
+        self._len_slider.setValue(20)
+        self._len_slider.valueChanged.connect(lambda v: self._len_lbl.setText(str(v)))
+        len_row.addWidget(self._len_slider, 1)
+        self._len_lbl = QLabel("20")
+        len_row.addWidget(self._len_lbl)
+        bl.addLayout(len_row)
 
-        len_row = ctk.CTkFrame(body, fg_color="transparent")
-        len_row.pack(fill="x", pady=(0, 16))
-        ctk.CTkLabel(len_row, text="Length", font=FONT_SM, text_color=TEXT2,
-                     width=70, anchor="w").pack(side="left")
-        self._len_var = tk.IntVar(value=20)
-        self._len_lbl = ctk.CTkLabel(len_row, text="20", font=FONT_BOLD,
-                                      text_color=TEXT, width=30, anchor="e")
-        self._len_lbl.pack(side="right")
-        ctk.CTkSlider(
-            len_row, from_=8, to=32, number_of_steps=24,
-            variable=self._len_var,
-            button_color=ACCENT, button_hover_color=ACCENT_HV,
-            progress_color=ACCENT, fg_color=SURFACE,
-            command=lambda v: self._len_lbl.configure(text=str(int(v))),
-        ).pack(side="left", fill="x", expand=True, padx=(10, 10))
+        card = QFrame()
+        card.setFrameShape(QFrame.Shape.StyledPanel)
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(18, 12, 18, 12)
+        cl.setSpacing(8)
+        self._upper   = self._checkbox(cl, "Uppercase   (A–Z)")
+        self._lower   = self._checkbox(cl, "Lowercase   (a–z)")
+        self._digits  = self._checkbox(cl, "Numbers     (0–9)")
+        self._symbols = self._checkbox(cl, "Symbols     (!@#…)")
+        bl.addWidget(card)
 
-        card = ctk.CTkFrame(body, fg_color=SURFACE, corner_radius=10,
-                            border_width=1, border_color=BORDER)
-        card.pack(fill="x", pady=(0, 16))
-        checks = ctk.CTkFrame(card, fg_color="transparent")
-        checks.pack(fill="x", padx=18, pady=(12, 12))
+        srow = QHBoxLayout()
+        self._strength_bar = QProgressBar()
+        self._strength_bar.setRange(0, 100)
+        self._strength_bar.setValue(0)
+        self._strength_bar.setTextVisible(False)
+        self._strength_bar.setFixedHeight(6)
+        srow.addWidget(self._strength_bar, 1)
+        self._strength_lbl = QLabel("")
+        self._strength_lbl.setFixedWidth(82)
+        self._strength_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        srow.addWidget(self._strength_lbl)
+        bl.addLayout(srow)
 
-        self._upper   = self._checkbox(checks, "Uppercase   (A–Z)")
-        self._lower   = self._checkbox(checks, "Lowercase   (a–z)")
-        self._digits  = self._checkbox(checks, "Numbers     (0–9)")
-        self._symbols = self._checkbox(checks, "Symbols     (!@#…)")
+        gen_btn = _btn("Generate")
+        gen_btn.setFixedHeight(44)
+        gen_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        gen_btn.clicked.connect(self._generate)
+        bl.addWidget(gen_btn)
 
-        srow = ctk.CTkFrame(body, fg_color="transparent")
-        srow.pack(fill="x", pady=(0, 16))
-        self._strength_bar = ctk.CTkProgressBar(
-            srow, height=6, corner_radius=3,
-            fg_color=SURFACE, progress_color=BORDER,
-        )
-        self._strength_bar.set(0)
-        self._strength_bar.pack(side="left", fill="x", expand=True)
-        self._strength_lbl = ctk.CTkLabel(
-            srow, text="", font=FONT_SM, text_color=TEXT2, width=82, anchor="e",
-        )
-        self._strength_lbl.pack(side="right", padx=(12, 0))
-
-        ctk.CTkButton(
-            body, text="Generate", height=44, font=FONT_BOLD,
-            fg_color=ACCENT, hover_color=ACCENT_HV, corner_radius=8,
-            command=self._generate,
-        ).pack(fill="x")
-
-    def _checkbox(self, parent, label: str) -> tk.BooleanVar:
-        var = tk.BooleanVar(value=True)
-        ctk.CTkCheckBox(
-            parent, text=label, variable=var,
-            font=FONT, text_color=TEXT2,
-            fg_color=ACCENT, hover_color=ACCENT_HV,
-            border_color=BORDER, checkmark_color="#ffffff",
-            checkbox_width=18, checkbox_height=18, corner_radius=4,
-        ).pack(anchor="w", pady=4)
-        return var
+    def _checkbox(self, layout: QVBoxLayout, text: str) -> QCheckBox:
+        cb = QCheckBox(text)
+        cb.setChecked(True)
+        layout.addWidget(cb)
+        return cb
 
     def _generate(self) -> None:
         pwd = _gen_password(
-            self._len_var.get(),
-            upper=self._upper.get(), lower=self._lower.get(),
-            digits=self._digits.get(), symbols=self._symbols.get(),
+            self._len_slider.value(),
+            upper=self._upper.isChecked(),
+            lower=self._lower.isChecked(),
+            digits=self._digits.isChecked(),
+            symbols=self._symbols.isChecked(),
         )
         if not pwd:
             return
-        self._output.delete(0, "end")
-        self._output.insert(0, pwd)
-        pct, label, color = _password_strength(pwd)
-        self._strength_bar.set(pct / 100)
-        self._strength_bar.configure(progress_color=color)
-        self._strength_lbl.configure(text=label, text_color=color)
-        self._copied_lbl.configure(text="")
+        self._output.setText(pwd)
+        pct, label = _password_strength(pwd)
+        self._strength_bar.setValue(pct)
+        self._strength_lbl.setText(label)
+        self._copied_lbl.setText("")
 
     def _copy(self) -> None:
-        pwd = self._output.get()
+        pwd = self._output.text()
         if not pwd:
             return
-        self.clipboard_clear()
-        self.clipboard_append(pwd)
-        self.update()
-        self._copied_lbl.configure(text="✓  Copied!")
-        self.after(2000, lambda: (
-            self._copied_lbl.configure(text="")
-            if self._copied_lbl.winfo_exists() else None
-        ))
+        _copy_to_clipboard(pwd)
+        self._copied_lbl.setText("Copied!")
+        QTimer.singleShot(2000, lambda: self._copied_lbl.setText(""))
 
 
-# ── Autofill picker (multiple matches) ────────────────────────────────────────
+# ── Autofill picker ────────────────────────────────────────────────────────────
 
-class AppFillDialog(_BaseDialog):
-    """Shown when Ctrl+Shift+F finds multiple credentials for the active app."""
-
-    def __init__(self, parent: App, creds: list, hwnd: int) -> None:
+class AppFillDialog(BaseDialog):
+    def __init__(self, parent, creds: list, hwnd: int) -> None:
         app_name = creds[0].get("app_name") or creds[0]["domain"]
-        super().__init__(parent, f"Autofill — {app_name}")
+        h = 60 + len(creds) * 64 + 24
+        super().__init__(parent, f"Autofill — {app_name}", 380, h)
         self._creds = creds
         self._hwnd  = hwnd
         self._build(app_name)
 
     def _build(self, app_name: str) -> None:
-        hdr = ctk.CTkFrame(self, height=48, fg_color=HEADER_BG, corner_radius=0)
-        hdr.pack(fill="x")
-        hdr.pack_propagate(False)
-        ctk.CTkLabel(hdr, text=f"Choose login for {app_name}",
-                     font=FONT_BOLD, text_color=TEXT).pack(side="left", padx=20)
-
-        body = ctk.CTkFrame(self, fg_color=BG)
-        body.pack(fill="both", expand=True, padx=16, pady=12)
+        self._header(f"Choose login for {app_name}", height=48)
+        body = self._body_widget()
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(16, 12, 16, 12)
+        bl.setSpacing(8)
 
         for cred in self._creds:
-            row = ctk.CTkFrame(body, fg_color=SURFACE, corner_radius=8)
-            row.pack(fill="x", pady=4)
-            inner = ctk.CTkFrame(row, fg_color="transparent")
-            inner.pack(fill="x", padx=12, pady=8)
+            row = QFrame()
+            row.setFrameShape(QFrame.Shape.StyledPanel)
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(12, 8, 12, 8)
+            rl.setSpacing(8)
+            rl.addWidget(QLabel(cred["username"]), 1)
 
-            ctk.CTkLabel(inner, text=cred["username"], font=FONT, text_color=TEXT,
-                         anchor="w").pack(side="left", fill="x", expand=True)
+            copy_btn = _btn("Copy")
+            copy_btn.setFixedSize(62, 30)
+            copy_btn.clicked.connect(lambda _, c=cred: self._do_copy(c))
+            rl.addWidget(copy_btn)
 
-            ctk.CTkButton(
-                inner, text="Copy", width=62, height=30, font=FONT_SM, corner_radius=6,
-                fg_color="transparent", border_width=1, border_color=BORDER,
-                hover_color=SURFACE_HV, text_color=TEXT2,
-                command=lambda c=cred: self._do_copy(c),
-            ).pack(side="left", padx=(0, 6))
+            fill_btn = _btn("Fill")
+            fill_btn.setFixedSize(62, 30)
+            fill_btn.clicked.connect(lambda _, c=cred: self._do_fill(c))
+            rl.addWidget(fill_btn)
 
-            ctk.CTkButton(
-                inner, text="Fill", width=62, height=30, font=FONT_SM, corner_radius=6,
-                fg_color=ACCENT, hover_color=ACCENT_HV,
-                command=lambda c=cred: self._do_fill(c),
-            ).pack(side="left")
-
-        h = 48 + 12 + len(self._creds) * 64 + 12
-        self.geometry(f"380x{h}")
+            bl.addWidget(row)
+        bl.addStretch(1)
 
     def _do_copy(self, cred: dict) -> None:
-        self.clipboard_clear()
-        self.clipboard_append(cred["password"])
-        self.update()
-        self.destroy()
+        _copy_to_clipboard(cred["password"])
+        self.accept()
 
     def _do_fill(self, cred: dict) -> None:
-        hwnd     = self._hwnd
-        username = cred["username"]
-        password = cred["password"]
-        self.destroy()
+        hwnd = self._hwnd
+        username, password = cred["username"], cred["password"]
+        self.accept()
 
         def _fill():
             time.sleep(0.3)
@@ -2257,409 +2287,453 @@ class AppFillDialog(_BaseDialog):
         threading.Thread(target=_fill, daemon=True).start()
 
 
-# ── Send-to-Phone dialog ──────────────────────────────────────────────────────
+# ── Send to phone ──────────────────────────────────────────────────────────────
 
-class SendToPhoneDialog(_BaseDialog):
+class SendToPhoneDialog(BaseDialog):
     _TIMEOUT = 60
 
-    def __init__(self, parent: App, vault) -> None:
-        super().__init__(parent, "Send to Phone", "320x460")
+    def __init__(self, parent, vault) -> None:
+        super().__init__(parent, "Send to Phone", 320, 460)
         self._server: _PhoneExportServer | None = None
         self._seconds = self._TIMEOUT
         self._done    = False
         self._start_server(vault)
         self._build()
-        self.after(1000, self._tick)
-        self.after(300,  self._poll)
+        self._tick_timer = QTimer(self)
+        self._tick_timer.timeout.connect(self._tick)
+        self._tick_timer.start(1000)
+        self._poll_timer = QTimer(self)
+        self._poll_timer.timeout.connect(self._poll)
+        self._poll_timer.start(300)
 
     def _start_server(self, vault) -> None:
-        port         = _find_free_port()
-        token        = secrets.token_urlsafe(16)
-        self._url    = f"http://{_get_local_ip()}:{port}/export/{token}"
+        port      = _find_free_port()
+        token     = secrets.token_urlsafe(16)
+        self._url = f"http://{_get_local_ip()}:{port}/export/{token}"
         self._server = _PhoneExportServer(vault, token, port)
 
     def _build(self) -> None:
-        hdr = ctk.CTkFrame(self, height=52, fg_color=HEADER_BG, corner_radius=0)
-        hdr.pack(fill="x")
-        hdr.pack_propagate(False)
-        ctk.CTkLabel(hdr, text="Send to Phone", font=FONT_BOLD,
-                     text_color=TEXT).pack(side="left", padx=20)
+        self._header("Send to Phone")
+        body = self._body_widget()
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(20, 16, 20, 16)
+        bl.setSpacing(10)
+        bl.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        body = ctk.CTkFrame(self, fg_color=BG)
-        body.pack(fill="both", expand=True, padx=20, pady=16)
-
-        ctk.CTkLabel(
-            body,
-            text="Make sure your phone is on the same network, then scan:",
-            font=FONT_SM, text_color=TEXT2, wraplength=260, justify="center",
-        ).pack(pady=(0, 14))
+        hint = QLabel("Make sure your phone is on the same network, then scan:")
+        hint.setWordWrap(True)
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        bl.addWidget(hint)
+        bl.addSpacing(4)
 
         try:
             import qrcode as _qr
+            from PIL import Image as PilImage
             qr = _qr.QRCode(box_size=7, border=2,
                             error_correction=_qr.constants.ERROR_CORRECT_M)
             qr.add_data(self._url)
             qr.make(fit=True)
             pil_img = qr.make_image(fill_color=(0, 0, 0),
                                     back_color=(255, 255, 255)).convert("RGB")
-            ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(220, 220))
-            ctk.CTkLabel(body, image=ctk_img, text="").pack(pady=(0, 12))
+            data = pil_img.tobytes("raw", "RGB")
+            qimg = QImage(data, pil_img.width, pil_img.height,
+                          QImage.Format.Format_RGB888)
+            px = QPixmap.fromImage(qimg).scaled(
+                220, 220,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            img_lbl = QLabel()
+            img_lbl.setPixmap(px)
+            img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            bl.addWidget(img_lbl)
         except Exception:
-            ctk.CTkLabel(
-                body,
-                text="Install  qrcode[pil]  to display the QR code.",
-                font=FONT_SM, text_color=TEXT2, wraplength=260, justify="center",
-            ).pack(pady=(0, 12))
+            bl.addWidget(QLabel("Install  qrcode[pil]  to display the QR code."))
 
-        url_e = ctk.CTkEntry(
-            body, font=("Consolas", 9), height=28,
-            fg_color=INPUT_BG, border_color=BORDER, text_color=TEXT2,
-        )
-        url_e.insert(0, self._url)
-        url_e.configure(state="readonly")
-        url_e.pack(fill="x", pady=(0, 12))
+        url_e = QLineEdit(self._url)
+        url_e.setReadOnly(True)
+        url_e.setFixedHeight(28)
+        bl.addWidget(url_e)
 
-        self._status_lbl = ctk.CTkLabel(
-            body, text=f"Expires in {self._seconds}s",
-            font=FONT_SM, text_color=TEXT2,
-        )
-        self._status_lbl.pack(pady=(0, 10))
+        self._status_lbl = QLabel(f"Expires in {self._seconds}s")
+        self._status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        bl.addWidget(self._status_lbl)
 
-        ctk.CTkButton(
-            body, text="Cancel", height=36, font=FONT,
-            fg_color="transparent", border_width=1, border_color=BORDER,
-            hover_color=SURFACE, text_color=TEXT2,
-            command=self.destroy,
-        ).pack(fill="x")
+        bl.addStretch(1)
+        cancel = _btn("Cancel")
+        cancel.setFixedHeight(36)
+        cancel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        cancel.clicked.connect(self.reject)
+        bl.addWidget(cancel)
 
     def _tick(self) -> None:
-        if self._done or not self.winfo_exists():
+        if self._done:
             return
         self._seconds -= 1
         if self._seconds <= 0:
             self._finish(expired=True)
             return
-        self._status_lbl.configure(text=f"Expires in {self._seconds}s")
-        self.after(1000, self._tick)
+        self._status_lbl.setText(f"Expires in {self._seconds}s")
 
     def _poll(self) -> None:
-        if self._done or not self.winfo_exists():
+        if self._done:
             return
         if self._server and self._server.used.is_set():
             self._finish(expired=False)
-            return
-        self.after(300, self._poll)
 
     def _finish(self, *, expired: bool) -> None:
         self._done = True
+        self._tick_timer.stop()
+        self._poll_timer.stop()
         if not expired:
-            self._status_lbl.configure(text="Downloaded!", text_color=GREEN)
-            self.after(1800, self.destroy)
+            self._status_lbl.setText("Downloaded!")
+            QTimer.singleShot(1800, self.accept)
         else:
-            self.destroy()
+            self.reject()
 
-    def destroy(self) -> None:
+    def closeEvent(self, event) -> None:
         if self._server:
             self._server.shutdown()
-        try:
-            super().destroy()
-        except Exception:
-            pass
+        super().closeEvent(event)
+
+    def reject(self) -> None:
+        if self._server:
+            self._server.shutdown()
+        super().reject()
 
 
-# ── Hotkey dialog ─────────────────────────────────────────────────────────────
+# ── Hotkey dialog ──────────────────────────────────────────────────────────────
 
-class HotkeyDialog(_BaseDialog):
-    """Captures a new global hotkey combination from a key press event."""
+class HotkeyDialog(BaseDialog):
+    _CTRL_MASK  = Qt.KeyboardModifier.ControlModifier
+    _SHIFT_MASK = Qt.KeyboardModifier.ShiftModifier
+    _ALT_MASK   = Qt.KeyboardModifier.AltModifier
 
-    _CTRL_MASK  = 0x0004
-    _SHIFT_MASK = 0x0001
-    _ALT_MASK   = 0x20000
-
-    _MOD_KEYSYMS = frozenset({
-        "Shift_L", "Shift_R", "Control_L", "Control_R",
-        "Alt_L", "Alt_R", "Caps_Lock", "Super_L", "Super_R",
-        "ISO_Level3_Shift",
-    })
-
-    def __init__(self, parent: App, current_label: str, on_save,
-                 on_close=None) -> None:
-        super().__init__(parent, "Change Autofill Hotkey", "420x310")
+    def __init__(self, parent, current_label: str, on_save) -> None:
+        super().__init__(parent, "Change Autofill Hotkey", 420, 310)
         self._on_save  = on_save
-        self._on_close = on_close
-        self._captured = None  # (mod_flags, vk, label_str)
-        self._closed   = False
-        self.protocol("WM_DELETE_WINDOW", self._do_close)
+        self._captured = None
         self._build(current_label)
 
-    def _do_close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        cb = self._on_close
-        self._on_close = None
-        self.destroy()
-        if cb:
-            cb()
-
     def _build(self, current_label: str) -> None:
-        hdr = ctk.CTkFrame(self, height=48, fg_color=HEADER_BG, corner_radius=0)
-        hdr.pack(fill="x")
-        hdr.pack_propagate(False)
-        ctk.CTkLabel(hdr, text="Change Autofill Hotkey",
-                     font=FONT_BOLD, text_color=TEXT).pack(side="left", padx=20)
+        self._header("Change Autofill Hotkey", height=48)
+        body = self._body_widget()
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(22, 14, 22, 14)
+        bl.setSpacing(8)
 
-        body = ctk.CTkFrame(self, fg_color=BG)
-        body.pack(fill="both", expand=True, padx=22, pady=14)
+        bl.addWidget(QLabel(f"Current:  {current_label}"))
 
-        ctk.CTkLabel(
-            body, text=f"Current:  {current_label}",
-            font=FONT_SM, text_color=TEXT2, anchor="w",
-        ).pack(fill="x", pady=(0, 10))
-
-        ctk.CTkLabel(
-            body,
-            text="Click the box below, then press the desired combination.\n"
-                 "Must include Ctrl, Shift, or Alt with a letter (A–Z) or F1–F12.",
-            font=FONT_SM, text_color=TEXT2, anchor="w",
-            justify="left", wraplength=370,
-        ).pack(fill="x", pady=(0, 8))
-
-        self._capture_frame = ctk.CTkFrame(
-            body, fg_color=INPUT_BG, border_width=2,
-            border_color=BORDER, corner_radius=8,
+        hint = QLabel(
+            "Click the box below, then press the desired combination.\n"
+            "Must include Ctrl, Shift, or Alt with a letter (A–Z) or F1–F12."
         )
-        self._capture_frame.pack(fill="x")
-        self._capture_lbl = ctk.CTkLabel(
-            self._capture_frame,
-            text="Click here, then press hotkey…",
-            font=("Consolas", 13), text_color=TEXT2, height=52,
-        )
-        self._capture_lbl.pack(fill="x", padx=14)
+        hint.setWordWrap(True)
+        bl.addWidget(hint)
 
-        self._err = ctk.CTkLabel(body, text="", text_color=DANGER, font=FONT_SM)
-        self._err.pack(anchor="w", pady=(6, 0))
+        self._capture_frame = QFrame()
+        self._capture_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        self._capture_frame.setFixedHeight(56)
+        self._capture_frame.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._capture_frame.mousePressEvent = lambda e: self._activate()
+        cfl = QHBoxLayout(self._capture_frame)
+        self._capture_lbl = QLabel("Click here, then press hotkey…")
+        self._capture_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cfl.addWidget(self._capture_lbl)
+        bl.addWidget(self._capture_frame)
 
-        btn_row = ctk.CTkFrame(body, fg_color="transparent")
-        btn_row.pack(fill="x", pady=(10, 0))
-        ctk.CTkButton(
-            btn_row, text="Cancel", width=110, height=38, font=FONT,
-            fg_color="transparent", border_width=1, border_color=BORDER,
-            hover_color=SURFACE, text_color=TEXT2,
-            command=self._do_close,
-        ).pack(side="left")
-        self._ok_btn = ctk.CTkButton(
-            btn_row, text="Save", width=110, height=38, font=FONT_BOLD,
-            fg_color=BORDER, hover_color=BORDER, state="disabled",
-            command=self._submit,
-        )
-        self._ok_btn.pack(side="right")
+        self._err_lbl = QLabel("")
+        bl.addWidget(self._err_lbl)
 
-        for w in (self._capture_frame, self._capture_lbl):
-            w.bind("<Button-1>", lambda e: self._activate_capture())
-        self.bind("<KeyPress>", self._on_key)
+        bl.addStretch(1)
+        btn_row = QHBoxLayout()
+        cancel = _btn("Cancel")
+        cancel.setFixedSize(110, 38)
+        cancel.clicked.connect(self.reject)
+        btn_row.addWidget(cancel)
+        btn_row.addStretch(1)
+        self._ok_btn = _btn("Save")
+        self._ok_btn.setFixedSize(110, 38)
+        self._ok_btn.setEnabled(False)
+        self._ok_btn.clicked.connect(self._submit)
+        btn_row.addWidget(self._ok_btn)
+        bl.addLayout(btn_row)
 
-    def _activate_capture(self) -> None:
-        self._capture_frame.configure(border_color=ACCENT)
-        self._capture_lbl.configure(text="Listening…", text_color=ACCENT)
-        self.focus_set()
+    def _activate(self) -> None:
+        self._capture_lbl.setText("Listening…")
+        self.setFocus()
 
-    def _on_key(self, event) -> None:
-        if event.keysym in self._MOD_KEYSYMS:
+    def keyPressEvent(self, event) -> None:
+        key  = event.key()
+        mods = event.modifiers()
+
+        modifier_keys = {
+            Qt.Key.Key_Control, Qt.Key.Key_Shift, Qt.Key.Key_Alt,
+            Qt.Key.Key_Meta, Qt.Key.Key_CapsLock,
+        }
+        if key in modifier_keys:
             return
 
-        mods: list[str] = []
         mod_flags = 0
-        if event.state & self._CTRL_MASK:
-            mods.append("Ctrl")
-            mod_flags |= _autofill.MOD_CONTROL
-        if event.state & self._SHIFT_MASK:
-            mods.append("Shift")
-            mod_flags |= _autofill.MOD_SHIFT
-        if event.state & self._ALT_MASK:
-            mods.append("Alt")
-            mod_flags |= _autofill.MOD_ALT
+        mod_parts = []
+        if mods & Qt.KeyboardModifier.ControlModifier:
+            mod_flags |= _autofill.MOD_CONTROL; mod_parts.append("Ctrl")
+        if mods & Qt.KeyboardModifier.ShiftModifier:
+            mod_flags |= _autofill.MOD_SHIFT;   mod_parts.append("Shift")
+        if mods & Qt.KeyboardModifier.AltModifier:
+            mod_flags |= _autofill.MOD_ALT;     mod_parts.append("Alt")
 
-        if not mods:
-            self._capture_frame.configure(border_color=DANGER)
-            self._err.configure(
-                text="At least one modifier (Ctrl, Shift, Alt) is required."
-            )
+        if not mod_parts:
+            self._err_lbl.setText("At least one modifier (Ctrl, Shift, Alt) is required.")
             return
 
-        ks = event.keysym.upper()
         vk: int | None = None
-        if len(ks) == 1 and ks.isalpha():
-            vk = ord(ks)
-        elif ks.startswith("F") and ks[1:].isdigit():
-            n = int(ks[1:])
-            if 1 <= n <= 12:
-                vk = 0x6F + n
+        key_name = ""
+        if Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
+            vk = key - Qt.Key.Key_A + 0x41
+            key_name = chr(vk)
+        elif Qt.Key.Key_F1 <= key <= Qt.Key.Key_F12:
+            n = key - Qt.Key.Key_F1 + 1
+            vk = 0x6F + n
+            key_name = f"F{n}"
 
         if vk is None:
-            self._capture_frame.configure(border_color=DANGER)
-            self._err.configure(
-                text=f"'{event.keysym}' is not supported. Use A–Z or F1–F12."
-            )
+            self._err_lbl.setText("Use A–Z or F1–F12.")
             return
 
-        label = "+".join(mods + [ks])
+        label = "+".join(mod_parts + [key_name])
         self._captured = (mod_flags, vk, label)
-        self._capture_frame.configure(border_color=GREEN)
-        self._capture_lbl.configure(text=label, text_color=TEXT)
-        self._ok_btn.configure(state="normal", fg_color=ACCENT, hover_color=ACCENT_HV)
-        self._err.configure(text="")
+        self._capture_lbl.setText(label)
+        self._ok_btn.setEnabled(True)
+        self._err_lbl.setText("")
 
     def _submit(self) -> None:
         if self._captured:
             self._on_save(*self._captured)
-        self._do_close()
+        self.accept()
 
 
-# ── Info dialog ───────────────────────────────────────────────────────────────
+# ── Info dialog ────────────────────────────────────────────────────────────────
 
-class InfoDialog(_BaseDialog):
-    def __init__(self, parent: App) -> None:
-        super().__init__(parent, "Info", "500x740")
-        self._app = parent
+class InfoDialog(BaseDialog):
+    def __init__(self, parent) -> None:
+        super().__init__(parent, "Info", 500, 650)
+        self._win = parent
         self._build()
 
     def _build(self) -> None:
-        hdr = ctk.CTkFrame(self, height=52, fg_color=HEADER_BG, corner_radius=0)
-        hdr.pack(fill="x")
-        hdr.pack_propagate(False)
-        ctk.CTkLabel(hdr, text="Info", font=FONT_BOLD, text_color=TEXT).pack(
-            side="left", padx=20
+        self._header("Info")
+        body = self._body_widget()
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(20, 14, 20, 14)
+        bl.setSpacing(8)
+
+        warn = QLabel(
+            "Back up the device key file — losing it means losing access to the vault."
         )
-
-        body = ctk.CTkFrame(self, fg_color=BG)
-        body.pack(fill="both", expand=True, padx=20, pady=14)
-
-        # ── Device info ───────────────────────────────────────────────────────
-        ctk.CTkLabel(
-            body,
-            text="Back up the device key file — losing it means losing access to the vault.",
-            font=FONT_SM, text_color=TEXT2, wraplength=450, justify="left",
-        ).pack(anchor="w", pady=(0, 10))
+        warn.setWordWrap(True)
+        bl.addWidget(warn)
 
         key = _load_key()
-        self._row(body, "Key file",  str(_key_path()))
-        self._row(body, "Database",  str(DB_PATH))
-        self._row(body, "API key",   key, copyable=True)
+        self._info_row(bl, "Key file",  str(_key_path()))
+        self._info_row(bl, "Database",  str(DB_PATH))
+        self._info_row(bl, "API key",   key, copyable=True)
 
-        # ── Chrome extension ──────────────────────────────────────────────────
-        ctk.CTkFrame(body, height=1, fg_color=BORDER).pack(fill="x", pady=(14, 10))
-
-        ctk.CTkLabel(body, text="Chrome Extension", font=FONT_BOLD,
-                     text_color=TEXT, anchor="w").pack(fill="x", pady=(0, 6))
+        bl.addWidget(_separator())
+        bl.addWidget(QLabel("Chrome Extension"))
 
         ext_path = _read_ext_path()
         if ext_path:
-            self._row(body, "Folder", ext_path, open_folder=True)
+            self._info_row(bl, "Folder", ext_path, open_folder=True)
 
-        ctk.CTkLabel(body, text="How to load in Chrome:",
-                     font=FONT_SM, text_color=TEXT2, anchor="w").pack(fill="x", pady=(8, 4))
-
+        bl.addWidget(QLabel("How to load in Chrome:"))
         for i, step in enumerate([
             "Open Chrome and go to   chrome://extensions",
             "Enable  Developer mode  using the toggle in the top-right corner",
             "Click  Load unpacked  and select the extension folder",
         ], 1):
-            row = ctk.CTkFrame(body, fg_color="transparent")
-            row.pack(fill="x", pady=3)
-            ctk.CTkLabel(row, text=str(i), width=22, font=FONT_BOLD,
-                         text_color=ACCENT, anchor="w").pack(side="left")
-            ctk.CTkLabel(row, text=step, font=FONT_SM, text_color=TEXT,
-                         anchor="w", wraplength=420, justify="left").pack(side="left")
+            row = QHBoxLayout()
+            num = QLabel(str(i))
+            num.setFixedWidth(22)
+            row.addWidget(num)
+            step_lbl = QLabel(step)
+            step_lbl.setWordWrap(True)
+            row.addWidget(step_lbl, 1)
+            bl.addLayout(row)
 
-        # ── Startup ───────────────────────────────────────────────────────────
-        ctk.CTkFrame(body, height=1, fg_color=BORDER).pack(fill="x", pady=(14, 10))
-        ctk.CTkLabel(body, text="Startup", font=FONT_BOLD,
-                     text_color=TEXT, anchor="w").pack(fill="x", pady=(0, 6))
+        bl.addWidget(_separator())
+        bl.addWidget(QLabel("Startup"))
 
         cfg = _load_config()
-        self._tray_var = tk.BooleanVar(value=bool(cfg.get("start_in_tray", False)))
-        ctk.CTkCheckBox(
-            body, text="Start minimized to system tray",
-            variable=self._tray_var,
-            font=FONT_SM, text_color=TEXT2,
-            fg_color=ACCENT, hover_color=ACCENT_HV,
-            border_color=BORDER, checkmark_color="#ffffff",
-            checkbox_width=18, checkbox_height=18, corner_radius=4,
-            command=self._toggle_tray,
-        ).pack(anchor="w", pady=(0, 4))
+        self._tray_cb = QCheckBox("Start minimized to system tray")
+        self._tray_cb.setChecked(bool(cfg.get("start_in_tray", False)))
+        self._tray_cb.stateChanged.connect(self._toggle_tray)
+        bl.addWidget(self._tray_cb)
 
-        # ── Autofill hotkey ───────────────────────────────────────────────────
-        ctk.CTkFrame(body, height=1, fg_color=BORDER).pack(fill="x", pady=(14, 10))
-        ctk.CTkLabel(body, text="Autofill Hotkey", font=FONT_BOLD,
-                     text_color=TEXT, anchor="w").pack(fill="x", pady=(0, 6))
+        bl.addWidget(_separator())
+        bl.addWidget(QLabel("Autofill Hotkey"))
 
-        hk_row = ctk.CTkFrame(body, fg_color=SURFACE, corner_radius=8)
-        hk_row.pack(fill="x", pady=3)
-        hk_inner = ctk.CTkFrame(hk_row, fg_color="transparent")
-        hk_inner.pack(fill="x", padx=12, pady=7)
-        ctk.CTkLabel(
-            hk_inner, text=_get_hotkey_label(),
-            font=("Consolas", 12), text_color=TEXT, anchor="w",
-        ).pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(
-            hk_inner, text="Change", width=70, height=28, font=FONT_SM,
-            fg_color=ACCENT, hover_color=ACCENT_HV,
-            command=self._change_hotkey,
-        ).pack(side="left", padx=(8, 0))
+        hk_row = QFrame()
+        hk_row.setFrameShape(QFrame.Shape.StyledPanel)
+        hkl = QHBoxLayout(hk_row)
+        hkl.setContentsMargins(12, 7, 12, 7)
+        hkl.addWidget(QLabel(_get_hotkey_label()), 1)
+        change_btn = _btn("Change")
+        change_btn.setFixedSize(70, 28)
+        change_btn.clicked.connect(self._change_hotkey)
+        hkl.addWidget(change_btn)
+        bl.addWidget(hk_row)
 
-        ctk.CTkButton(
-            body, text="Close", width=90, height=36, font=FONT,
-            fg_color=ACCENT, hover_color=ACCENT_HV,
-            command=self.destroy,
-        ).pack(pady=(12, 0))
+        bl.addSpacing(12)
+        close_btn = _btn("Close")
+        close_btn.setFixedSize(90, 36)
+        close_btn.clicked.connect(self.accept)
+        bl.addWidget(close_btn, 0, Qt.AlignmentFlag.AlignCenter)
+
+    def _info_row(self, layout: QVBoxLayout, label: str, value: str,
+                  copyable: bool = False, open_folder: bool = False) -> None:
+        row = QFrame()
+        row.setFrameShape(QFrame.Shape.StyledPanel)
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(12, 7, 12, 7)
+        rl.setSpacing(8)
+        rl.addWidget(QLabel(label))
+        e = QLineEdit(value)
+        e.setReadOnly(True)
+        e.setFixedHeight(28)
+        rl.addWidget(e, 1)
+        if copyable:
+            cb = _btn("Copy")
+            cb.setFixedSize(54, 28)
+            cb.clicked.connect(lambda: _copy_to_clipboard(value))
+            rl.addWidget(cb)
+        if open_folder:
+            sb = _btn("Show")
+            sb.setFixedSize(54, 28)
+            sb.clicked.connect(
+                lambda: subprocess.Popen(f'explorer /select,"{value}"', shell=True)
+            )
+            rl.addWidget(sb)
+        layout.addWidget(row)
 
     def _toggle_tray(self) -> None:
         cfg = _load_config()
-        cfg["start_in_tray"] = self._tray_var.get()
+        cfg["start_in_tray"] = self._tray_cb.isChecked()
         _save_config(cfg)
 
     def _change_hotkey(self) -> None:
-        self.destroy()
-        self._app._open_hotkey_dialog()
-
-    def _row(self, parent, label: str, value: str,
-             copyable: bool = False, open_folder: bool = False) -> None:
-        row = ctk.CTkFrame(parent, fg_color=SURFACE, corner_radius=8)
-        row.pack(fill="x", pady=3)
-        inner = ctk.CTkFrame(row, fg_color="transparent")
-        inner.pack(fill="x", padx=12, pady=7)
-
-        ctk.CTkLabel(inner, text=label, font=FONT_SM, text_color=TEXT2,
-                     width=80, anchor="w").pack(side="left")
-
-        e = ctk.CTkEntry(inner, font=("Consolas", 10), height=28,
-                         fg_color=INPUT_BG, border_color=BORDER, text_color=TEXT)
-        e.insert(0, value)
-        e.configure(state="readonly")
-        e.pack(side="left", fill="x", expand=True)
-
-        if copyable:
-            ctk.CTkButton(
-                inner, text="Copy", width=54, height=28, font=FONT_SM,
-                fg_color=ACCENT, hover_color=ACCENT_HV,
-                command=lambda: (
-                    self.clipboard_clear(),
-                    self.clipboard_append(value),
-                    self.update(),
-                ),
-            ).pack(side="left", padx=(8, 0))
-
-        if open_folder:
-            ctk.CTkButton(
-                inner, text="Show", width=54, height=28, font=FONT_SM,
-                fg_color="transparent", border_width=1, border_color=BORDER,
-                hover_color=SURFACE_HV, text_color=TEXT2,
-                command=lambda: subprocess.Popen(f'explorer /select,"{value}"', shell=True),
-            ).pack(side="left", padx=(8, 0))
+        self.accept()
+        self._win._open_hotkey_dialog()
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Auto-update dialog ─────────────────────────────────────────────────────────
+
+class UpdateDialog(BaseDialog):
+    _progress_sig = pyqtSignal(int)
+    _done_sig     = pyqtSignal(str)
+    _error_sig    = pyqtSignal(str)
+
+    def __init__(self, parent, tag: str, download_url: str) -> None:
+        super().__init__(parent, "Update Available", 440, 250)
+        self._tag = tag
+        self._url = download_url
+        self._build()
+        self._progress_sig.connect(self._bar.setValue)
+        self._done_sig.connect(self._on_done)
+        self._error_sig.connect(self._on_error)
+
+    def _build(self) -> None:
+        self._header("Update Available")
+        body = self._body_widget()
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(22, 16, 22, 16)
+        bl.setSpacing(8)
+
+        bl.addWidget(QLabel(f"Version  {self._tag}  is available."))
+        hint = QLabel(
+            "The installer will download and launch automatically.\n"
+            "The app will close so the update can be applied."
+        )
+        hint.setWordWrap(True)
+        bl.addWidget(hint)
+
+        self._bar = QProgressBar()
+        self._bar.setRange(0, 100)
+        self._bar.setTextVisible(False)
+        self._bar.setFixedHeight(6)
+        self._bar.hide()
+        bl.addWidget(self._bar)
+
+        self._status_lbl = QLabel("")
+        bl.addWidget(self._status_lbl)
+
+        bl.addStretch(1)
+
+        row = QHBoxLayout()
+        self._skip_btn = _btn("Skip")
+        self._skip_btn.setFixedSize(100, 36)
+        self._skip_btn.clicked.connect(self.reject)
+        row.addWidget(self._skip_btn)
+        row.addStretch(1)
+        self._dl_btn = _btn("Download & Install")
+        self._dl_btn.setFixedSize(170, 36)
+        self._dl_btn.clicked.connect(self._start_download)
+        row.addWidget(self._dl_btn)
+        bl.addLayout(row)
+
+    def _start_download(self) -> None:
+        self._dl_btn.setEnabled(False)
+        self._skip_btn.setEnabled(False)
+        self._bar.setValue(0)
+        self._bar.show()
+        self._status_lbl.setText("Downloading…")
+        threading.Thread(target=self._download_worker, daemon=True).start()
+
+    def _download_worker(self) -> None:
+        try:
+            tmp = tempfile.mktemp(suffix=".exe", prefix="PMSetup-")
+
+            def _hook(count, block, total):
+                if total > 0:
+                    self._progress_sig.emit(min(100, int(count * block * 100 / total)))
+
+            urllib.request.urlretrieve(self._url, tmp, _hook)
+            self._done_sig.emit(tmp)
+        except Exception as exc:
+            self._error_sig.emit(str(exc))
+
+    def _on_done(self, path: str) -> None:
+        self._status_lbl.setText("Launching installer…")
+        subprocess.Popen([path])
+        QTimer.singleShot(600, lambda: QApplication.instance().quit())
+
+    def _on_error(self, msg: str) -> None:
+        self._status_lbl.setText(f"Download failed: {msg}")
+        self._dl_btn.setEnabled(True)
+        self._skip_btn.setEnabled(True)
+        self._bar.hide()
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    App().mainloop()
+    app = QApplication(sys.argv)
+    app.setApplicationName("Password Manager")
+    app.setStyleSheet("""
+        QPushButton { padding: 4px 10px; }
+        QWidget#group_header {
+            background-color: #1a3263;
+        }
+        QWidget#group_header QLabel {
+            color: white;
+        }
+        QWidget#group_header QPushButton {
+            color: white;
+        }
+        QFrame#credential_group {
+            border: none;
+        }
+    """)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())

@@ -220,23 +220,30 @@ def wait_stopped(timeout: float = 1.0) -> None:
 
 def start(
     vault_getter: Callable,
-    tk_root,
     show_picker: Callable,
     modifiers: int = MOD_CONTROL | MOD_SHIFT,
     vk: int = VK_F,
+    schedule_fn: Callable | None = None,
+    tk_root=None,
 ) -> bool:
     """
     Register a global hotkey via RegisterHotKey.
 
-    vault_getter() — returns the live Vault instance
-    tk_root       — the tkinter root window (for scheduling on main thread)
-    show_picker(creds, hwnd) — called when multiple matches exist
-    modifiers     — OR'd MOD_* flags (default: Ctrl+Shift)
-    vk            — virtual key code (default: F)
+    vault_getter()            — returns the live Vault instance
+    show_picker(creds, hwnd)  — called when multiple matches exist
+    modifiers                 — OR'd MOD_* flags (default: Ctrl+Shift)
+    vk                        — virtual key code (default: F)
+    schedule_fn(fn)           — schedules fn() on the main thread
+    tk_root                   — legacy alias for schedule_fn (tkinter root)
 
-    Returns True on success, False if RegisterHotKey fails (e.g. hotkey already taken).
+    Returns True on success, False if RegisterHotKey fails.
     """
     global _hotkey_thread
+
+    if schedule_fn is None and tk_root is not None:
+        schedule_fn = lambda fn: tk_root.after(0, fn)
+    elif schedule_fn is None:
+        schedule_fn = lambda fn: fn()
 
     def _on_hotkey() -> None:
         hwnd, title = get_foreground_info()
@@ -256,7 +263,7 @@ def start(
                 daemon=True,
             ).start()
         else:
-            tk_root.after(0, lambda: show_picker(matches, hwnd))
+            schedule_fn(lambda: show_picker(matches, hwnd))
 
     t = threading.Thread(
         target=_message_loop,

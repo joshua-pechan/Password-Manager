@@ -6,7 +6,7 @@ from functools import wraps
 
 from flask import Flask, jsonify, request
 
-from vault import Vault, VaultError
+from vault import Vault
 from device_key import load as _load_key
 
 HOST = "127.0.0.1"
@@ -31,23 +31,23 @@ def require_auth(f):
 
 # ── CORS (localhost + Chrome extension origins only) ──────────────────────────
 
-@app.after_request
-def _cors(response):
-    origin = request.headers.get("Origin", "")
-    if (
-        origin.startswith("chrome-extension://")
-        or origin in (f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}")
-    ):
-        response.headers["Access-Control-Allow-Origin"]  = origin
-        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Api-Key"
-    return response
+# @app.after_request
+# def _cors(response):
+#     origin = request.headers.get("Origin", "")
+#     if (
+#         origin.startswith("chrome-extension://")
+#         or origin in (f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}")
+#     ):
+#         response.headers["Access-Control-Allow-Origin"]  = origin
+#         response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+#         response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Api-Key"
+#     return response
 
 
-@app.route("/", defaults={"path": ""}, methods=["OPTIONS"])
-@app.route("/<path:path>", methods=["OPTIONS"])
-def _preflight(path=""):
-    return "", 204
+# @app.route("/", defaults={"path": ""}, methods=["OPTIONS"])
+# @app.route("/<path:path>", methods=["OPTIONS"])
+# def _preflight(path=""):
+#     return "", 204
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────

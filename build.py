@@ -61,14 +61,15 @@ def build_main_app(ico: pathlib.Path) -> pathlib.Path:
         # Bundle the lock icon so the window titlebar icon works at runtime
         f"--add-data={EXTENSION / 'icons' / 'icon128.png'}{os.pathsep}.",
         # Collect all data files for packages that need them at runtime
-        "--collect-all", "customtkinter",
         "--collect-all", "pystray",
+        "--exclude-module", "PyQt5",
+        "--exclude-module", "customtkinter",
         # Tell PyInstaller where to find the backend source modules
         f"--paths={SRC}",
         f"--paths={BACKEND}",
         # Dynamic imports that the static analyser can miss
+        "--hidden-import", "version",
         "--hidden-import", "keyboard",
-        "--hidden-import", "PIL._tkinter_finder",
         "--hidden-import", "cryptography.hazmat.backends",
         "--hidden-import", "cryptography.hazmat.primitives.kdf.pbkdf2",
         "--hidden-import", "pystray._base_icon",
@@ -99,7 +100,8 @@ def build_installer(app_exe: pathlib.Path, ico: pathlib.Path) -> pathlib.Path:
         "--workpath", BUILD / "installer",
         "--specpath", BUILD,
         f"--icon={ico}",
-        "--collect-all", "customtkinter",
+        "--exclude-module", "PyQt5",
+        "--exclude-module", "customtkinter",
         # Embed the main EXE at the root of the bundle
         f"--add-data={app_exe}{sep}.",
         # Embed the whole extension folder
