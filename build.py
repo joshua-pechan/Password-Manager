@@ -102,6 +102,7 @@ def build_installer(app_exe: pathlib.Path, ico: pathlib.Path) -> pathlib.Path:
         f"--icon={ico}",
         "--exclude-module", "PyQt5",
         "--exclude-module", "customtkinter",
+        f"--paths={BACKEND}",
         # Embed the main EXE at the root of the bundle
         f"--add-data={app_exe}{sep}.",
         # Embed the whole extension folder

@@ -37,6 +37,7 @@ from vault import Vault, VaultError
 from device_key import load as _load_key, path as _key_path, exists as _key_exists
 from database import DB_PATH
 import autofill as _autofill
+from theme import _C, apply_dark_theme as _apply_dark_theme
 
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
@@ -373,9 +374,9 @@ class CredentialCard(QFrame):
         self._selected = selected
         if selected:
             self.setStyleSheet(
-                "QFrame#credential_card { background-color: #cce4f7; }"
-                " QFrame#credential_card QLabel { color: #1a1a1a; }"
-                " QFrame#credential_card QPushButton { color: #1a1a1a; }"
+                f"QFrame#credential_card {{ background-color: {_C.hover}; }}"
+                f" QFrame#credential_card QLabel {{ color: {_C.white}; }}"
+                f" QFrame#credential_card QPushButton {{ color: {_C.white}; }}"
             )
         else:
             self.setStyleSheet("")
@@ -2752,21 +2753,8 @@ class UpdateDialog(BaseDialog):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setApplicationName("Password Manager")
-    app.setStyleSheet("""
-        QPushButton { padding: 4px 10px; }
-        QWidget#group_header {
-            background-color: #1a3263;
-        }
-        QWidget#group_header QLabel {
-            color: white;
-        }
-        QWidget#group_header QPushButton {
-            color: white;
-        }
-        QFrame#credential_group {
-            border: none;
-        }
-    """)
+    _apply_dark_theme(app)
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
+

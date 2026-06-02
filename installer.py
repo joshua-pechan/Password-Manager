@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QCheckBox, QProgressBar, QHBoxLayout, QVBoxLayout,
     QFileDialog, QMessageBox,
 )
+from theme import apply_dark_theme as _apply_dark_theme
 
 _REG_KEY           = r"Software\PasswordManager"
 _UNINSTALL_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\PasswordManager"
@@ -586,6 +587,7 @@ class InstallerApp(QWidget):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    _apply_dark_theme(app)
     window = InstallerApp()
     window.show()
     sys.exit(app.exec())
