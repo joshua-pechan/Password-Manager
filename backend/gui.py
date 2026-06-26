@@ -196,12 +196,15 @@ class _Scheduler(QObject):
 # ── Phone export server ────────────────────────────────────────────────────────
 
 class _PhoneExportServer:
-    def __init__(self, vault, token: str, port: int) -> None:
-        self.used    = threading.Event()
-        self._vault  = vault
-        self._token  = token
-        self._port   = port
-        self._server = None
+    def __init__(self, vault, token: str, port: int,
+                 cert_path: pathlib.Path, key_path: pathlib.Path) -> None:
+        self.used       = threading.Event()
+        self._vault     = vault
+        self._token     = token
+        self._port      = port
+        self._cert_path = cert_path
+        self._key_path  = key_path
+        self._server    = None
         threading.Thread(target=self._run, daemon=True, name="phone-export").start()
 
     def _run(self) -> None:
@@ -209,7 +212,8 @@ class _PhoneExportServer:
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
-                if self.path != f"/export/{token}":
+                from urllib.parse import urlparse as _up
+                if _up(self.path).path != f"/export/{token}":
                     self.send_response(404); self.end_headers(); return
                 creds = vault.get_all()
                 buf   = io.StringIO()
@@ -232,7 +236,11 @@ class _PhoneExportServer:
             def log_message(self, *_): pass
 
         try:
+            import ssl
             srv = http.server.HTTPServer(("0.0.0.0", self._port), Handler)
+            ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_ctx.load_cert_chain(str(self._cert_path), str(self._key_path))
+            srv.socket = ssl_ctx.wrap_socket(srv.socket, server_side=True)
             srv.timeout = 1
             self._server = srv
             deadline = time.monotonic() + 65
@@ -304,6 +312,54 @@ def _find_free_port() -> int:
     with socket.socket() as s:
         s.bind(("", 0))
         return s.getsockname()[1]
+
+def _get_local_hostname() -> str:
+    return socket.gethostname().split(".")[0] + ".local"
+
+def _cert_fingerprint(cert_path: pathlib.Path) -> str:
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+    return cert.fingerprint(hashes.SHA256()).hex()
+
+def _ensure_export_cert() -> tuple[pathlib.Path, pathlib.Path, str]:
+    """Returns (cert_path, key_path, hostname) — generates once, reuses thereafter."""
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    import datetime
+
+    cert_dir  = pathlib.Path.home() / ".password_manager"
+    cert_dir.mkdir(parents=True, exist_ok=True)
+    cert_path = cert_dir / "export_cert.pem"
+    key_path  = cert_dir / "export_key.pem"
+    hostname  = _get_local_hostname()
+
+    if cert_path.exists() and key_path.exists():
+        return cert_path, key_path, hostname
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostname)])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + datetime.timedelta(days=3650))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(hostname)]), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption(),
+    ))
+    return cert_path, key_path, hostname
 
 def _is_newer_version(remote: str, local: str) -> bool:
     def _parse(v: str):
@@ -2341,10 +2397,13 @@ class SendToPhoneDialog(BaseDialog):
         self._poll_timer.start(300)
 
     def _start_server(self, vault) -> None:
-        port      = _find_free_port()
-        token     = secrets.token_urlsafe(16)
-        self._url = f"http://{_get_local_ip()}:{port}/export/{token}"
-        self._server = _PhoneExportServer(vault, token, port)
+        port = _find_free_port()
+        token = secrets.token_urlsafe(16)
+        cert_path, key_path, hostname = _ensure_export_cert()
+        self._cert_path = cert_path
+        fp = _cert_fingerprint(cert_path)
+        self._url = f"https://{_get_local_ip()}:{port}/export/{token}?fp={fp}"
+        self._server = _PhoneExportServer(vault, token, port, cert_path, key_path)
 
     def _build(self) -> None:
         self._header("Send to Phone")
@@ -2369,20 +2428,22 @@ class SendToPhoneDialog(BaseDialog):
             qr.make(fit=True)
             pil_img = qr.make_image(fill_color=(0, 0, 0),
                                     back_color=(255, 255, 255)).convert("RGB")
-            data = pil_img.tobytes("raw", "RGB")
-            qimg = QImage(data, pil_img.width, pil_img.height,
-                          pil_img.width * 3, QImage.Format.Format_RGB888)
-            px = QPixmap.fromImage(qimg).scaled(
+            buf = io.BytesIO()
+            pil_img.save(buf, format="PNG")
+            buf.seek(0)
+            px = QPixmap()
+            px.loadFromData(buf.read())
+            px = px.scaled(
                 220, 220,
                 Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation
+                Qt.TransformationMode.FastTransformation
             )
             img_lbl = QLabel()
             img_lbl.setPixmap(px)
             img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             bl.addWidget(img_lbl)
-        except Exception:
-            bl.addWidget(QLabel("Install  qrcode[pil]  to display the QR code."))
+        except Exception as _e:
+            bl.addWidget(QLabel(f"QR error: {_e}"))
 
         url_e = QLineEdit(self._url)
         url_e.setReadOnly(True)

@@ -16,7 +16,7 @@ if not exist "%PYTHON%" (
         pause & exit /b 1
     )
     echo [setup]  Installing dependencies...
-    "%PIP%" install --quiet PyQt6 flask cryptography pystray keyboard Pillow pyinstaller
+    "%PIP%" install --quiet PyQt6 flask cryptography pystray keyboard Pillow "qrcode[pil]" pyinstaller
     if errorlevel 1 (
         echo ERROR: pip install failed.
         pause & exit /b 1
