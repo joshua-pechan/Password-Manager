@@ -2371,7 +2371,7 @@ class SendToPhoneDialog(BaseDialog):
                                     back_color=(255, 255, 255)).convert("RGB")
             data = pil_img.tobytes("raw", "RGB")
             qimg = QImage(data, pil_img.width, pil_img.height,
-                          QImage.Format.Format_RGB888)
+                          pil_img.width * 3, QImage.Format.Format_RGB888)
             px = QPixmap.fromImage(qimg).scaled(
                 220, 220,
                 Qt.AspectRatioMode.KeepAspectRatio,

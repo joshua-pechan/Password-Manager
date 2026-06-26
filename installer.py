@@ -10,25 +10,29 @@ from __future__ import annotations
 
 import os
 import pathlib
+import queue
 import shutil
 import subprocess
 import sys
 import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
 import winreg
-
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QIcon
-from PyQt6.QtWidgets import (
-    QApplication, QWidget, QFrame, QLabel, QPushButton,
-    QLineEdit, QCheckBox, QProgressBar, QHBoxLayout, QVBoxLayout,
-    QFileDialog, QMessageBox,
-)
-from theme import apply_dark_theme as _apply_dark_theme
 
 _REG_KEY           = r"Software\PasswordManager"
 _UNINSTALL_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\PasswordManager"
 _APP_VERSION       = "1.0"
 _PUBLISHER         = "Joshua Pechan"
+
+_BG      = "#1e1e1e"
+_SURFACE = "#2d2d2d"
+_CARD    = "#252525"
+_BTN     = "#3a3a3a"
+_HOVER   = "#484848"
+_FILL    = "#555555"
+_BORDER  = "#4a4a4a"
+_TEXT    = "#f0f0f0"
+_MID     = "#666666"
 
 
 # ── Registry helpers ──────────────────────────────────────────────────────────
@@ -114,43 +118,58 @@ def _kill_app() -> None:
     subprocess.run(["taskkill", "/f", "/im", "PasswordManager.exe"], capture_output=True)
 
 
-def _separator() -> QFrame:
-    line = QFrame()
-    line.setFrameShape(QFrame.Shape.HLine)
-    line.setFrameShadow(QFrame.Shadow.Sunken)
-    return line
-
-
 # ── Main window ───────────────────────────────────────────────────────────────
 
-class InstallerApp(QWidget):
-    _progress_sig        = pyqtSignal(str, float)
-    _install_done_sig    = pyqtSignal(str, str)
-    _uninstall_done_sig  = pyqtSignal()
-    _reinstall_done_sig  = pyqtSignal()
-    _error_sig           = pyqtSignal(str, str)
-    _unlock_uninstall_sig = pyqtSignal()
-
+class InstallerApp:
     def __init__(self) -> None:
-        super().__init__()
-        self.setWindowFlags(Qt.WindowType.Window)
-        self.setFixedWidth(560)
+        self.root = tk.Tk()
+        self.root.resizable(False, False)
+        self.root.configure(bg=_BG)
+        self._queue: queue.Queue = queue.Queue()
+        self._after_id: str | None = None
 
-        self._root_layout = QVBoxLayout(self)
-        self._root_layout.setContentsMargins(0, 0, 0, 0)
-        self._root_layout.setSpacing(0)
-
+        self._apply_theme()
         self._set_icon()
 
         existing_install, existing_ext = _reg_read()
         if existing_install and pathlib.Path(existing_install).exists():
-            self.setWindowTitle("Password Manager — Manage")
-            self.setFixedHeight(460)
+            self.root.title("Password Manager — Manage")
+            self.root.geometry("560x460")
             self._build_uninstall(existing_install, existing_ext or "")
         else:
-            self.setWindowTitle("Password Manager — Setup")
-            self.setFixedHeight(440)
+            self.root.title("Password Manager — Setup")
+            self.root.geometry("560x440")
             self._build_install()
+
+        self.root.mainloop()
+
+    def _apply_theme(self) -> None:
+        style = ttk.Style(self.root)
+        style.theme_use("clam")
+        style.configure(".",               background=_BG,      foreground=_TEXT)
+        style.configure("TFrame",          background=_BG)
+        style.configure("TLabel",          background=_BG,      foreground=_TEXT)
+        style.configure("TButton",         background=_BTN,     foreground=_TEXT,
+                        borderwidth=1,     relief="flat",       padding=(8, 5))
+        style.map("TButton",
+                  background=[("active", _HOVER), ("disabled", _BG)],
+                  foreground=[("disabled", _MID)])
+        style.configure("TEntry",          fieldbackground=_SURFACE, foreground=_TEXT,
+                        insertcolor=_TEXT, borderwidth=1,       relief="solid")
+        style.configure("TCheckbutton",    background=_BG,      foreground=_TEXT)
+        style.map("TCheckbutton",          background=[("active", _BG)])
+        style.configure("TProgressbar",    troughcolor=_SURFACE, background=_FILL,
+                        borderwidth=0,     thickness=6)
+        style.configure("TSeparator",      background=_BORDER)
+        style.configure("Header.TFrame",   background=_CARD)
+        style.configure("Header.TLabel",   background=_CARD,    foreground=_TEXT,
+                        font=("Segoe UI", 11))
+        style.configure("Section.TLabel",  background=_BG,      foreground=_TEXT,
+                        font=("Segoe UI", 9, "bold"))
+        style.configure("Info.TFrame",     background=_SURFACE)
+        style.configure("Info.TLabel",     background=_SURFACE, foreground=_TEXT)
+        style.configure("InfoKey.TLabel",  background=_SURFACE, foreground=_MID,
+                        font=("Segoe UI", 9))
 
     def _set_icon(self) -> None:
         try:
@@ -159,36 +178,23 @@ class InstallerApp(QWidget):
             img = Image.open(str(_bundled("extension/icons/icon128.png")))
             ico = pathlib.Path(tempfile.gettempdir()) / "pm_icon.ico"
             img.save(str(ico), format="ICO", sizes=[(32, 32), (48, 48)])
-            self.setWindowIcon(QIcon(str(ico)))
+            self.root.iconbitmap(str(ico))
         except Exception:
             pass
 
-    # ── Layout helpers ────────────────────────────────────────────────────────
-
-    def _make_header(self, text: str) -> QFrame:
-        hdr = QFrame()
-        hdr.setFixedHeight(62)
-        hdr.setFrameShape(QFrame.Shape.StyledPanel)
-        lay = QHBoxLayout(hdr)
-        lay.setContentsMargins(20, 0, 20, 0)
-        lay.addWidget(QLabel(text))
-        lay.addStretch()
+    def _make_header(self, text: str) -> ttk.Frame:
+        hdr = ttk.Frame(self.root, style="Header.TFrame", height=62)
+        hdr.pack_propagate(False)
+        ttk.Label(hdr, text=text, style="Header.TLabel").pack(side="left", padx=20)
         return hdr
 
-    def _make_section_label(self, text: str) -> QLabel:
-        return QLabel(text)
+    def _make_section_label(self, parent: tk.Widget, text: str) -> ttk.Label:
+        return ttk.Label(parent, text=text, style="Section.TLabel")
 
-    def _make_info_row(self, label: str, value: str) -> QFrame:
-        row = QFrame()
-        row.setFrameShape(QFrame.Shape.StyledPanel)
-        lay = QHBoxLayout(row)
-        lay.setContentsMargins(12, 8, 12, 8)
-        lbl = QLabel(label)
-        lbl.setFixedWidth(100)
-        val = QLabel(value)
-        val.setWordWrap(True)
-        lay.addWidget(lbl)
-        lay.addWidget(val, 1)
+    def _make_info_row(self, parent: tk.Widget, label: str, value: str) -> ttk.Frame:
+        row = ttk.Frame(parent, style="Info.TFrame", padding=(12, 8))
+        ttk.Label(row, text=label, style="InfoKey.TLabel", width=12).pack(side="left")
+        ttk.Label(row, text=value, style="Info.TLabel", wraplength=380).pack(side="left", fill="x", expand=True)
         return row
 
     # =========================================================================
@@ -196,181 +202,153 @@ class InstallerApp(QWidget):
     # =========================================================================
 
     def _build_install(self) -> None:
-        self._install_inputs: list[QWidget] = []
+        self._make_header("Password Manager  —  Setup").pack(fill="x")
 
-        self._root_layout.addWidget(self._make_header("Password Manager  —  Setup"))
+        body = ttk.Frame(self.root, padding=(28, 20, 28, 20))
+        body.pack(fill="both", expand=True)
 
-        body = QWidget()
-        lay = QVBoxLayout(body)
-        lay.setContentsMargins(28, 20, 28, 20)
-        lay.setSpacing(0)
-        self._root_layout.addWidget(body, 1)
+        self._make_section_label(body, "Install Location").pack(anchor="w")
+        ttk.Separator(body).pack(fill="x", pady=(2, 6))
 
-        lay.addWidget(self._make_section_label("Install Location"))
-        lay.addSpacing(4)
-
-        path_row = QWidget()
-        path_lay = QHBoxLayout(path_row)
-        path_lay.setContentsMargins(0, 0, 0, 0)
-        path_lay.setSpacing(6)
+        path_row = ttk.Frame(body)
+        path_row.pack(fill="x")
 
         default = str(pathlib.Path.home() / "AppData" / "Local" / "PasswordManager")
-        self._install_entry = QLineEdit(default)
-        self._install_entry.setFixedHeight(38)
+        self._install_var = tk.StringVar(value=default)
+        self._install_entry = ttk.Entry(path_row, textvariable=self._install_var, width=50)
+        self._install_entry.pack(side="left", fill="x", expand=True, ipady=4)
 
-        browse_btn = QPushButton("Browse")
-        browse_btn.setFixedSize(80, 38)
-        browse_btn.clicked.connect(self._browse_install)
+        self._browse_btn = ttk.Button(path_row, text="Browse", width=8,
+                                      command=self._browse_install)
+        self._browse_btn.pack(side="left", padx=(6, 0))
 
-        path_lay.addWidget(self._install_entry, 1)
-        path_lay.addWidget(browse_btn)
-        lay.addWidget(path_row)
-        self._install_inputs.extend([self._install_entry, browse_btn])
+        ttk.Label(body,
+            text="The Chrome extension will be installed inside this folder.\n"
+                 "Open the app and click  Info  for instructions on loading it in Chrome.",
+            foreground=_MID, wraplength=490,
+        ).pack(anchor="w", pady=(6, 12))
 
-        hint = QLabel(
-            "The Chrome extension will be installed inside this folder.\n"
-            "Open the app and click  Info  for instructions on loading it in Chrome."
-        )
-        hint.setWordWrap(True)
-        lay.addSpacing(6)
-        lay.addWidget(hint)
-        lay.addSpacing(12)
+        self._make_section_label(body, "Options").pack(anchor="w")
+        ttk.Separator(body).pack(fill="x", pady=(2, 6))
 
-        lay.addWidget(self._make_section_label("Options"))
-        lay.addSpacing(4)
+        self._desktop_var = tk.BooleanVar(value=True)
+        self._startup_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(body, text="Create desktop shortcut",
+                        variable=self._desktop_var).pack(anchor="w")
+        ttk.Checkbutton(body, text="Launch automatically on Windows startup",
+                        variable=self._startup_var).pack(anchor="w", pady=(3, 0))
 
-        self._desktop_cb = QCheckBox("Create desktop shortcut")
-        self._desktop_cb.setChecked(True)
-        lay.addWidget(self._desktop_cb)
-        lay.addSpacing(3)
+        ttk.Separator(body).pack(fill="x", pady=(14, 8))
 
-        self._startup_cb = QCheckBox("Launch automatically on Windows startup")
-        self._startup_cb.setChecked(True)
-        lay.addWidget(self._startup_cb)
-        self._install_inputs.extend([self._desktop_cb, self._startup_cb])
+        self._install_status_var = tk.StringVar(value="Ready to install.")
+        ttk.Label(body, textvariable=self._install_status_var).pack(anchor="w")
 
-        lay.addSpacing(14)
-        lay.addWidget(_separator())
-        lay.addSpacing(8)
+        self._install_bar = ttk.Progressbar(body, maximum=1000, value=0)
+        self._install_bar.pack(fill="x", pady=(4, 12))
 
-        self._install_status = QLabel("Ready to install.")
-        lay.addWidget(self._install_status)
-        lay.addSpacing(4)
-
-        self._install_bar = QProgressBar()
-        self._install_bar.setRange(0, 1000)
-        self._install_bar.setValue(0)
-        self._install_bar.setFixedHeight(6)
-        self._install_bar.setTextVisible(False)
-        lay.addWidget(self._install_bar)
-        lay.addSpacing(12)
-
-        btns = QWidget()
-        btns_lay = QHBoxLayout(btns)
-        btns_lay.setContentsMargins(0, 0, 0, 0)
-
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.setFixedSize(110, 40)
-        cancel_btn.clicked.connect(self.close)
-
-        self._install_btn = QPushButton("Install")
-        self._install_btn.setFixedSize(140, 40)
-        self._install_btn.clicked.connect(self._install_start)
-
-        btns_lay.addWidget(cancel_btn)
-        btns_lay.addStretch()
-        btns_lay.addWidget(self._install_btn)
-        lay.addWidget(btns)
-
-        self._progress_sig.connect(self._on_install_progress)
-        self._install_done_sig.connect(self._install_done)
-        self._error_sig.connect(self._on_install_error)
+        btns = ttk.Frame(body)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Cancel", width=10, command=self.root.destroy).pack(side="left")
+        self._install_btn = ttk.Button(btns, text="Install", width=12,
+                                       command=self._install_start)
+        self._install_btn.pack(side="right")
 
     def _browse_install(self) -> None:
-        current = pathlib.Path(self._install_entry.text())
+        current = pathlib.Path(self._install_var.get())
         initial = str(current.parent) if current.parent.exists() else str(pathlib.Path.home())
-        d = QFileDialog.getExistingDirectory(self, "Select Install Folder", initial)
+        d = filedialog.askdirectory(parent=self.root, title="Select Install Folder",
+                                    initialdir=initial)
         if d:
-            self._install_entry.setText(str(pathlib.Path(d) / current.name))
-
-    def _on_install_progress(self, msg: str, pct: float) -> None:
-        self._install_status.setText(msg)
-        self._install_bar.setValue(int(pct * 1000))
-
-    def _set_install_locked(self, locked: bool) -> None:
-        for w in self._install_inputs:
-            w.setEnabled(not locked)
+            self._install_var.set(str(pathlib.Path(d) / current.name))
 
     def _install_start(self) -> None:
-        self._set_install_locked(True)
-        self._install_btn.setEnabled(False)
-        self._install_btn.setText("Installing...")
-        path    = self._install_entry.text().strip()
-        desktop = self._desktop_cb.isChecked()
-        startup = self._startup_cb.isChecked()
-        threading.Thread(target=self._install_run, args=(path, desktop, startup), daemon=True).start()
+        self._install_entry.config(state="disabled")
+        self._browse_btn.config(state="disabled")
+        self._install_btn.config(state="disabled", text="Installing...")
+        path    = self._install_var.get().strip()
+        desktop = self._desktop_var.get()
+        startup = self._startup_var.get()
+        self._after_id = self.root.after(50, self._poll_install_queue)
+        threading.Thread(target=self._install_run, args=(path, desktop, startup),
+                         daemon=True).start()
+
+    def _poll_install_queue(self) -> None:
+        try:
+            while True:
+                item = self._queue.get_nowait()
+                kind = item[0]
+                if kind == "progress":
+                    self._install_status_var.set(item[1])
+                    self._install_bar["value"] = int(item[2] * 1000)
+                elif kind == "done":
+                    self._install_done(item[1], item[2])
+                    return
+                elif kind == "error":
+                    messagebox.showerror(item[1], item[2], parent=self.root)
+                    self._install_entry.config(state="normal")
+                    self._browse_btn.config(state="normal")
+                    self._install_btn.config(state="normal", text="Install")
+                    return
+        except queue.Empty:
+            pass
+        self._after_id = self.root.after(50, self._poll_install_queue)
 
     def _install_run(self, path: str, desktop: bool, startup: bool) -> None:
         try:
             install_dir = pathlib.Path(path)
             ext_dir     = install_dir / "extension"
 
-            self._progress_sig.emit("Creating install directory...", 0.10)
+            self._queue.put(("progress", "Creating install directory...", 0.10))
             install_dir.mkdir(parents=True, exist_ok=True)
 
-            self._progress_sig.emit("Copying application...", 0.30)
+            self._queue.put(("progress", "Copying application...", 0.30))
             dst_exe   = install_dir / "PasswordManager.exe"
             dst_setup = install_dir / "PasswordManager_Setup.exe"
             shutil.copy2(_bundled("PasswordManager.exe"), dst_exe)
-            src_setup = sys.executable if getattr(sys, "frozen", False) else _bundled("dist/PasswordManager_Setup.exe")
+            src_setup = (sys.executable if getattr(sys, "frozen", False)
+                         else _bundled("dist/PasswordManager_Setup.exe"))
             shutil.copy2(src_setup, dst_setup)
 
-            self._progress_sig.emit("Copying Chrome extension...", 0.55)
+            self._queue.put(("progress", "Copying Chrome extension...", 0.55))
             if ext_dir.exists():
                 shutil.rmtree(ext_dir, ignore_errors=True)
             shutil.copytree(_bundled("extension"), ext_dir)
 
             if desktop:
-                self._progress_sig.emit("Creating desktop shortcut...", 0.72)
+                self._queue.put(("progress", "Creating desktop shortcut...", 0.72))
                 _make_shortcut(str(dst_exe),
                                str(pathlib.Path.home() / "Desktop" / "Password Manager.lnk"))
 
             if startup:
-                self._progress_sig.emit("Configuring startup...", 0.88)
+                self._queue.put(("progress", "Configuring startup...", 0.88))
                 try:
                     _set_startup(str(dst_exe), enable=True)
                 except Exception:
                     pass
 
-            self._progress_sig.emit("Saving install record...", 0.95)
+            self._queue.put(("progress", "Saving install record...", 0.95))
             _reg_write(str(install_dir), str(ext_dir), str(dst_setup))
 
-            self._progress_sig.emit("Installation complete!", 1.00)
-            self._install_done_sig.emit(str(dst_exe), str(ext_dir))
+            self._queue.put(("progress", "Installation complete!", 1.00))
+            self._queue.put(("done", str(dst_exe), str(ext_dir)))
 
         except Exception as exc:
-            self._error_sig.emit("Installation Failed", str(exc))
+            self._queue.put(("error", "Installation Failed", str(exc)))
 
     def _install_done(self, dst_exe: str, ext_dir: str) -> None:
         install_dir = str(pathlib.Path(dst_exe).parent)
-        reply = QMessageBox.question(
-            self, "Installation Complete",
+        launch = messagebox.askyesno(
+            "Installation Complete",
             f"Password Manager installed to:\n  {install_dir}\n\n"
             f"Chrome extension is at:\n  {ext_dir}\n\n"
             "To load it in Chrome, open the app and click  Info  —\n"
             "it shows the folder path and step-by-step instructions.\n\n"
             "Launch Password Manager now?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            parent=self.root,
         )
-        self.close()
-        if reply == QMessageBox.StandardButton.Yes:
+        self.root.destroy()
+        if launch:
             subprocess.Popen([dst_exe])
-
-    def _on_install_error(self, title: str, message: str) -> None:
-        QMessageBox.critical(self, title, message)
-        self._install_btn.setEnabled(True)
-        self._install_btn.setText("Install")
-        self._set_install_locked(False)
 
     # =========================================================================
     # UNINSTALL SIDE
@@ -380,144 +358,119 @@ class InstallerApp(QWidget):
         self._u_install_dir = install_dir
         self._u_ext_dir     = ext_dir
 
-        self._root_layout.addWidget(self._make_header("Password Manager  —  Manage Installation"))
+        self._make_header("Password Manager  —  Manage Installation").pack(fill="x")
 
-        body = QWidget()
-        lay = QVBoxLayout(body)
-        lay.setContentsMargins(28, 20, 28, 20)
-        lay.setSpacing(0)
-        self._root_layout.addWidget(body, 1)
+        body = ttk.Frame(self.root, padding=(28, 20, 28, 20))
+        body.pack(fill="both", expand=True)
 
-        lay.addWidget(self._make_section_label("Installed Files"))
-        lay.addSpacing(4)
-        lay.addWidget(self._make_info_row("Application", install_dir))
+        self._make_section_label(body, "Installed Files").pack(anchor="w")
+        ttk.Separator(body).pack(fill="x", pady=(2, 4))
+        self._make_info_row(body, "Application", install_dir).pack(fill="x", pady=(0, 3))
         if ext_dir:
-            lay.addSpacing(3)
-            lay.addWidget(self._make_info_row("Extension", ext_dir))
-        lay.addSpacing(12)
+            self._make_info_row(body, "Extension", ext_dir).pack(fill="x")
 
-        lay.addWidget(self._make_section_label("Options"))
-        lay.addSpacing(4)
+        ttk.Separator(body).pack(fill="x", pady=(12, 8))
 
-        self._delete_data_cb = QCheckBox("Also delete saved passwords and device key  (cannot be undone)")
-        self._delete_data_cb.setChecked(False)
-        lay.addWidget(self._delete_data_cb)
+        self._make_section_label(body, "Options").pack(anchor="w", pady=(0, 4))
+        self._delete_data_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(body,
+            text="Also delete saved passwords and device key  (cannot be undone)",
+            variable=self._delete_data_var).pack(anchor="w")
 
-        lay.addSpacing(14)
-        lay.addWidget(_separator())
-        lay.addSpacing(8)
+        ttk.Separator(body).pack(fill="x", pady=(14, 8))
 
-        self._u_status = QLabel("Ready to uninstall.")
-        lay.addWidget(self._u_status)
-        lay.addSpacing(4)
+        self._u_status_var = tk.StringVar(value="Ready to uninstall.")
+        ttk.Label(body, textvariable=self._u_status_var).pack(anchor="w")
 
-        self._u_bar = QProgressBar()
-        self._u_bar.setRange(0, 1000)
-        self._u_bar.setValue(0)
-        self._u_bar.setFixedHeight(6)
-        self._u_bar.setTextVisible(False)
-        lay.addWidget(self._u_bar)
-        lay.addSpacing(12)
+        self._u_bar = ttk.Progressbar(body, maximum=1000, value=0)
+        self._u_bar.pack(fill="x", pady=(4, 12))
 
-        btns = QWidget()
-        btns_lay = QHBoxLayout(btns)
-        btns_lay.setContentsMargins(0, 0, 0, 0)
-
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.setFixedSize(110, 40)
-        cancel_btn.clicked.connect(self.close)
-
-        self._r_btn = QPushButton("Reinstall")
-        self._r_btn.setFixedSize(120, 40)
-        self._r_btn.clicked.connect(self._reinstall_start)
-
-        self._u_btn = QPushButton("Uninstall")
-        self._u_btn.setFixedSize(120, 40)
-        self._u_btn.clicked.connect(self._uninstall_start)
-
-        btns_lay.addWidget(cancel_btn)
-        btns_lay.addStretch()
-        btns_lay.addWidget(self._r_btn)
-        btns_lay.addSpacing(8)
-        btns_lay.addWidget(self._u_btn)
-        lay.addWidget(btns)
-
-        self._progress_sig.connect(self._on_u_progress)
-        self._uninstall_done_sig.connect(self._uninstall_done)
-        self._reinstall_done_sig.connect(self._switch_to_install)
-        self._error_sig.connect(self._on_u_error)
-        self._unlock_uninstall_sig.connect(self._unlock_uninstall)
-
-    def _on_u_progress(self, msg: str, pct: float) -> None:
-        self._u_status.setText(msg)
-        self._u_bar.setValue(int(pct * 1000))
-
-    def _unlock_uninstall(self) -> None:
-        self._u_btn.setEnabled(True)
-        self._u_btn.setText("Uninstall")
-        self._r_btn.setEnabled(True)
-        self._r_btn.setText("Reinstall")
+        btns = ttk.Frame(body)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Cancel", width=10, command=self.root.destroy).pack(side="left")
+        self._r_btn = ttk.Button(btns, text="Reinstall", width=10,
+                                  command=self._reinstall_start)
+        self._r_btn.pack(side="right", padx=(8, 0))
+        self._u_btn = ttk.Button(btns, text="Uninstall", width=10,
+                                  command=self._uninstall_start)
+        self._u_btn.pack(side="right")
 
     def _uninstall_start(self) -> None:
-        reply = QMessageBox.question(
-            self, "Confirm Uninstall",
-            "Are you sure you want to uninstall Password Manager?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
+        if not messagebox.askyesno("Confirm Uninstall",
+                "Are you sure you want to uninstall Password Manager?",
+                parent=self.root):
             return
-        self._u_btn.setEnabled(False)
-        self._u_btn.setText("Uninstalling...")
-        self._r_btn.setEnabled(False)
-        delete_data = self._delete_data_cb.isChecked()
+        self._u_btn.config(state="disabled", text="Uninstalling...")
+        self._r_btn.config(state="disabled")
+        delete_data = self._delete_data_var.get()
+        self._after_id = self.root.after(50, self._poll_uninstall_queue)
         threading.Thread(target=self._uninstall_run, args=(delete_data,), daemon=True).start()
+
+    def _poll_uninstall_queue(self) -> None:
+        try:
+            while True:
+                item = self._queue.get_nowait()
+                kind = item[0]
+                if kind == "progress":
+                    self._u_status_var.set(item[1])
+                    self._u_bar["value"] = int(item[2] * 1000)
+                elif kind == "done":
+                    self._uninstall_done()
+                    return
+                elif kind == "reinstall_done":
+                    self._switch_to_install()
+                    return
+                elif kind == "error":
+                    messagebox.showerror(item[1], item[2], parent=self.root)
+                    self._u_btn.config(state="normal", text="Uninstall")
+                    self._r_btn.config(state="normal", text="Reinstall")
+                    return
+        except queue.Empty:
+            pass
+        self._after_id = self.root.after(50, self._poll_uninstall_queue)
 
     def _uninstall_run(self, delete_data: bool) -> None:
         try:
             install_dir = pathlib.Path(self._u_install_dir)
             ext_dir     = pathlib.Path(self._u_ext_dir) if self._u_ext_dir else None
 
-            self._progress_sig.emit("Stopping application...", 0.10)
+            self._queue.put(("progress", "Stopping application...", 0.10))
             _kill_app()
 
-            self._progress_sig.emit("Removing application files...", 0.25)
+            self._queue.put(("progress", "Removing application files...", 0.25))
             if install_dir.exists():
                 shutil.rmtree(install_dir, ignore_errors=True)
 
             if ext_dir and ext_dir.exists():
-                self._progress_sig.emit("Removing Chrome extension...", 0.45)
+                self._queue.put(("progress", "Removing Chrome extension...", 0.45))
                 shutil.rmtree(ext_dir, ignore_errors=True)
 
-            self._progress_sig.emit("Removing desktop shortcut...", 0.58)
+            self._queue.put(("progress", "Removing desktop shortcut...", 0.58))
             (pathlib.Path.home() / "Desktop" / "Password Manager.lnk").unlink(missing_ok=True)
 
-            self._progress_sig.emit("Removing startup entry...", 0.70)
+            self._queue.put(("progress", "Removing startup entry...", 0.70))
             try:
                 _set_startup("", enable=False)
             except Exception:
                 pass
 
             if delete_data:
-                self._progress_sig.emit("Deleting vault data...", 0.82)
+                self._queue.put(("progress", "Deleting vault data...", 0.82))
                 data_dir = pathlib.Path.home() / ".password_manager"
                 if data_dir.exists():
                     shutil.rmtree(data_dir, ignore_errors=True)
 
-            self._progress_sig.emit("Cleaning up registry...", 0.93)
+            self._queue.put(("progress", "Cleaning up registry...", 0.93))
             _reg_delete()
 
-            self._progress_sig.emit("Uninstall complete.", 1.00)
-            self._uninstall_done_sig.emit()
+            self._queue.put(("progress", "Uninstall complete.", 1.00))
+            self._queue.put(("done",))
 
         except Exception as exc:
-            self._error_sig.emit("Uninstall Failed", str(exc))
-            self._unlock_uninstall_sig.emit()
-
-    def _on_u_error(self, title: str, message: str) -> None:
-        QMessageBox.critical(self, title, message)
+            self._queue.put(("error", "Uninstall Failed", str(exc)))
 
     def _uninstall_done(self) -> None:
-        delete_data = self._delete_data_cb.isChecked()
+        delete_data = self._delete_data_var.get()
         msg = (
             "Password Manager has been removed from this PC.\n\n"
             + ("Your saved passwords and device key were also deleted.\n\n"
@@ -527,13 +480,13 @@ class InstallerApp(QWidget):
             + "If the Chrome extension is still loaded in Chrome, remove it manually:\n"
               "  chrome://extensions  →  find Password Manager  →  Remove"
         )
-        QMessageBox.information(self, "Uninstall Complete", msg)
-        self.close()
+        messagebox.showinfo("Uninstall Complete", msg, parent=self.root)
+        self.root.destroy()
 
     def _reinstall_start(self) -> None:
-        self._u_btn.setEnabled(False)
-        self._r_btn.setEnabled(False)
-        self._r_btn.setText("Reinstalling...")
+        self._u_btn.config(state="disabled")
+        self._r_btn.config(state="disabled", text="Reinstalling...")
+        self._after_id = self.root.after(50, self._poll_uninstall_queue)
         threading.Thread(target=self._reinstall_run, daemon=True).start()
 
     def _reinstall_run(self) -> None:
@@ -541,53 +494,41 @@ class InstallerApp(QWidget):
             install_dir = pathlib.Path(self._u_install_dir)
             ext_dir     = pathlib.Path(self._u_ext_dir) if self._u_ext_dir else None
 
-            self._progress_sig.emit("Stopping application...", 0.15)
+            self._queue.put(("progress", "Stopping application...", 0.15))
             _kill_app()
 
-            self._progress_sig.emit("Removing previous installation...", 0.40)
+            self._queue.put(("progress", "Removing previous installation...", 0.40))
             if install_dir.exists():
                 shutil.rmtree(install_dir, ignore_errors=True)
             if ext_dir and ext_dir.exists():
                 shutil.rmtree(ext_dir, ignore_errors=True)
 
-            self._progress_sig.emit("Removing shortcuts and startup...", 0.65)
+            self._queue.put(("progress", "Removing shortcuts and startup...", 0.65))
             (pathlib.Path.home() / "Desktop" / "Password Manager.lnk").unlink(missing_ok=True)
             try:
                 _set_startup("", enable=False)
             except Exception:
                 pass
 
-            self._progress_sig.emit("Cleaning up registry...", 0.85)
+            self._queue.put(("progress", "Cleaning up registry...", 0.85))
             _reg_delete()
 
-            self._progress_sig.emit("Ready to reinstall.", 1.00)
-            self._reinstall_done_sig.emit()
+            self._queue.put(("progress", "Ready to reinstall.", 1.00))
+            self._queue.put(("reinstall_done",))
 
         except Exception as exc:
-            self._error_sig.emit("Reinstall Failed", str(exc))
-            self._unlock_uninstall_sig.emit()
+            self._queue.put(("error", "Reinstall Failed", str(exc)))
 
     def _switch_to_install(self) -> None:
-        for sig in (self._progress_sig, self._error_sig, self._uninstall_done_sig,
-                    self._reinstall_done_sig, self._unlock_uninstall_sig):
-            try:
-                sig.disconnect()
-            except Exception:
-                pass
-
-        while self._root_layout.count():
-            item = self._root_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
-        self.setWindowTitle("Password Manager — Setup")
-        self.setFixedHeight(440)
+        if self._after_id:
+            self.root.after_cancel(self._after_id)
+            self._after_id = None
+        for widget in self.root.winfo_children():
+            widget.destroy()
+        self.root.title("Password Manager — Setup")
+        self.root.geometry("560x440")
         self._build_install()
 
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    _apply_dark_theme(app)
-    window = InstallerApp()
-    window.show()
-    sys.exit(app.exec())
+    InstallerApp()

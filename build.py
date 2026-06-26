@@ -16,19 +16,15 @@ What it does:
 """
 from __future__ import annotations
 
-import os
 import pathlib
 import shutil
 import subprocess
 import sys
-import tempfile
 
-ROOT      = pathlib.Path(__file__).parent
-BACKEND   = ROOT / "backend"
-SRC       = BACKEND / "src"
-EXTENSION = ROOT / "extension"
-DIST      = ROOT / "dist"
-BUILD     = ROOT / "build"
+ROOT    = pathlib.Path(__file__).parent
+BACKEND = ROOT / "backend"
+DIST    = ROOT / "dist"
+BUILD   = ROOT / "build"
 
 
 def run(cmd: list) -> None:
@@ -41,43 +37,19 @@ def make_ico() -> pathlib.Path:
     from PIL import Image
     BUILD.mkdir(parents=True, exist_ok=True)
     ico = BUILD / "icon.ico"
-    img = Image.open(EXTENSION / "icons" / "icon128.png")
+    img = Image.open(ROOT / "extension" / "icons" / "icon128.png")
     img.save(str(ico), format="ICO", sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128)])
     return ico
 
 
-def build_main_app(ico: pathlib.Path) -> pathlib.Path:
+def build_main_app() -> pathlib.Path:
     """Produce dist/PasswordManager.exe (self-contained, no Python needed)."""
     run([
         sys.executable, "-m", "PyInstaller",
         "--noconfirm",
-        "--onefile",
-        "--windowed",
-        "--name", "PasswordManager",
         "--distpath", DIST,
         "--workpath", BUILD / "app",
-        "--specpath", BUILD,
-        f"--icon={ico}",
-        # Bundle the lock icon so the window titlebar icon works at runtime
-        f"--add-data={EXTENSION / 'icons' / 'icon128.png'}{os.pathsep}.",
-        # Collect all data files for packages that need them at runtime
-        "--collect-all", "pystray",
-        "--exclude-module", "PyQt5",
-        "--exclude-module", "customtkinter",
-        # Tell PyInstaller where to find the backend source modules
-        f"--paths={SRC}",
-        f"--paths={BACKEND}",
-        # Dynamic imports that the static analyser can miss
-        "--hidden-import", "version",
-        "--hidden-import", "keyboard",
-        "--hidden-import", "cryptography.hazmat.backends",
-        "--hidden-import", "cryptography.hazmat.primitives.kdf.pbkdf2",
-        "--hidden-import", "pystray._base_icon",
-        "--hidden-import", "pystray.backends.win32",
-        "--hidden-import", "flask",
-        "--hidden-import", "werkzeug",
-        "--hidden-import", "werkzeug.serving",
-        BACKEND / "gui.py",
+        ROOT / "PasswordManager.spec",
     ])
     exe = DIST / "PasswordManager.exe"
     if not exe.exists():
@@ -85,29 +57,14 @@ def build_main_app(ico: pathlib.Path) -> pathlib.Path:
     return exe
 
 
-def build_installer(app_exe: pathlib.Path, ico: pathlib.Path) -> pathlib.Path:
+def build_installer(app_exe: pathlib.Path) -> pathlib.Path:
     """Produce dist/PasswordManager_Setup.exe embedding the app EXE + extension."""
-    # PyInstaller --add-data  src:dest  (colon on Linux/Mac, semicolon on Windows)
-    sep = os.pathsep  # ";" on Windows
-
     run([
         sys.executable, "-m", "PyInstaller",
         "--noconfirm",
-        "--onefile",
-        "--windowed",
-        "--name", "PasswordManager_Setup",
         "--distpath", DIST,
         "--workpath", BUILD / "installer",
-        "--specpath", BUILD,
-        f"--icon={ico}",
-        "--exclude-module", "PyQt5",
-        "--exclude-module", "customtkinter",
-        f"--paths={BACKEND}",
-        # Embed the main EXE at the root of the bundle
-        f"--add-data={app_exe}{sep}.",
-        # Embed the whole extension folder
-        f"--add-data={EXTENSION}{sep}extension",
-        ROOT / "installer.py",
+        ROOT / "PasswordManager_Setup.spec",
     ])
     exe = DIST / "PasswordManager_Setup.exe"
     if not exe.exists():
@@ -123,7 +80,7 @@ if __name__ == "__main__":
     # Sanity checks
     if not (BACKEND / "gui.py").exists():
         sys.exit("ERROR: backend/gui.py not found — run this script from the project root")
-    if not (EXTENSION / "manifest.json").exists():
+    if not (ROOT / "extension" / "manifest.json").exists():
         sys.exit("ERROR: extension/manifest.json not found")
 
     try:
@@ -137,12 +94,12 @@ if __name__ == "__main__":
 
     print("\n[2/3]  Building main application (PasswordManager.exe) ...")
     print("       This may take a few minutes.")
-    app_exe = build_main_app(ico)
+    app_exe = build_main_app()
     size_mb = app_exe.stat().st_size / 1_048_576
     print(f"       {app_exe}  ({size_mb:.1f} MB)")
 
     print("\n[3/3]  Building installer (PasswordManager_Setup.exe) ...")
-    setup_exe = build_installer(app_exe, ico)
+    setup_exe = build_installer(app_exe)
     size_mb = setup_exe.stat().st_size / 1_048_576
     print(f"       {setup_exe}  ({size_mb:.1f} MB)")
 

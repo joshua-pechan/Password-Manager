@@ -1,6 +1,7 @@
 # Build artifacts
 build/
 dist/
+build_venv/
 *.spec
 
 # Python cache
