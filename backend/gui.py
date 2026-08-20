@@ -259,6 +259,136 @@ class _PhoneExportServer:
             pass
 
 
+# ── Phone import server ────────────────────────────────────────────────────────
+
+def _import_csv_from_text(vault, csv_text: str) -> int:
+    """Parse phone CSV and merge new credentials into vault. Returns inserted count."""
+    existing = {(c["domain"], c["username"].lower()) for c in vault.get_all()}
+
+    reader = csv.reader(io.StringIO(csv_text))
+    rows   = list(reader)
+    if not rows:
+        return 0
+    if rows[0] and rows[0][0].lower() in ("title", "name"):
+        rows = rows[1:]
+
+    count = 0
+    for row in rows:
+        if len(row) < 4:
+            continue
+        title    = row[0].strip()
+        url      = row[1].strip()
+        username = row[2].strip()
+        password = row[3].strip()
+        # row[4] = notes (ignored)
+        cred_type = row[5].strip().lower() if len(row) > 5 else ""
+        group     = row[6].strip()         if len(row) > 6 else ""
+        tab       = row[7].strip()         if len(row) > 7 else ""
+
+        if not username or not password:
+            continue
+
+        effective_type = tab if (tab and tab not in ("web", "app")) else (cred_type or "web")
+
+        # Determine dedup domain key
+        if effective_type == "web" and url:
+            try:
+                from vault import _extract_domain
+                domain_key = _extract_domain(url)
+            except Exception:
+                domain_key = title.lower().strip()
+        else:
+            domain_key = (title or username).lower().strip()
+
+        if (domain_key, username.lower()) in existing:
+            continue  # already synced
+
+        try:
+            if effective_type == "web" and url:
+                vault.save(url, username, password, group)
+            elif effective_type == "app":
+                vault.save_app(title or username, username, password, group)
+            else:
+                try:
+                    vault.create_custom_tab(effective_type)
+                except Exception:
+                    pass
+                vault.save_to_tab(title or username, username, password, effective_type, group)
+            existing.add((domain_key, username.lower()))
+            count += 1
+        except Exception:
+            pass
+
+    return count
+
+
+class _PhoneImportServer:
+    def __init__(self, vault, token: str, port: int,
+                 cert_path: pathlib.Path, key_path: pathlib.Path) -> None:
+        self.received  = threading.Event()
+        self.count     = 0
+        self.error: str | None = None
+        self._vault    = vault
+        self._token    = token
+        self._port     = port
+        self._cert_path = cert_path
+        self._key_path  = key_path
+        self._server    = None
+        threading.Thread(target=self._run, daemon=True, name="phone-import").start()
+
+    def _run(self) -> None:
+        vault = self._vault; token = self._token; server_ref = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                from urllib.parse import urlparse as _up
+                if _up(self.path).path != f"/import/{token}":
+                    self.send_response(404); self.end_headers(); return
+                try:
+                    length   = int(self.headers.get("Content-Length", 0))
+                    csv_data = self.rfile.read(length).decode("utf-8")
+                    count    = _import_csv_from_text(vault, csv_data)
+                    server_ref.count = count
+                    resp = json.dumps({"ok": True, "count": count}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type",   "application/json")
+                    self.send_header("Content-Length", str(len(resp)))
+                    self.end_headers(); self.wfile.write(resp)
+                except Exception as exc:
+                    server_ref.error = str(exc)
+                    resp = json.dumps({"ok": False, "error": str(exc)}).encode()
+                    self.send_response(500)
+                    self.send_header("Content-Type",   "application/json")
+                    self.send_header("Content-Length", str(len(resp)))
+                    self.end_headers(); self.wfile.write(resp)
+                finally:
+                    server_ref.received.set()
+            def log_message(self, *_): pass
+
+        try:
+            import ssl
+            srv = http.server.HTTPServer(("0.0.0.0", self._port), Handler)
+            ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_ctx.load_cert_chain(str(self._cert_path), str(self._key_path))
+            srv.socket  = ssl_ctx.wrap_socket(srv.socket, server_side=True)
+            srv.timeout = 1
+            self._server = srv
+            deadline = time.monotonic() + 120
+            while not self.received.is_set() and time.monotonic() < deadline:
+                srv.handle_request()
+        finally:
+            if self._server:
+                self._server.server_close()
+
+    def shutdown(self) -> None:
+        self.received.set()
+        try:
+            if self._server:
+                self._server.server_close()
+        except Exception:
+            pass
+
+
 # ── Shared UI helpers ──────────────────────────────────────────────────────────
 
 def _btn(text: str, parent=None) -> QPushButton:
@@ -1584,6 +1714,7 @@ class MainWidget(QWidget):
         menu.addAction("Full Backup (JSON)…",  self._export_json)
         menu.addSeparator()
         menu.addAction("Send to Phone",        self._send_to_phone)
+        menu.addAction("Receive from Phone",   self._receive_from_phone)
         pos = self._transfer_btn.mapToGlobal(
             QPoint(0, self._transfer_btn.height() + 2)
         )
@@ -1868,6 +1999,10 @@ class MainWidget(QWidget):
 
     def _send_to_phone(self) -> None:
         SendToPhoneDialog(self._win, self._win.vault).exec()
+
+    def _receive_from_phone(self) -> None:
+        ReceiveFromPhoneDialog(self._win, self._win.vault).exec()
+        self._refresh()
 
     def _show_info(self) -> None:
         InfoDialog(self._win).exec()
@@ -2483,6 +2618,131 @@ class SendToPhoneDialog(BaseDialog):
         if not expired:
             self._status_lbl.setText("Downloaded!")
             QTimer.singleShot(1800, self.accept)
+        else:
+            self.reject()
+
+    def closeEvent(self, event) -> None:
+        if self._server:
+            self._server.shutdown()
+        super().closeEvent(event)
+
+    def reject(self) -> None:
+        if self._server:
+            self._server.shutdown()
+        super().reject()
+
+
+# ── Receive-from-phone dialog ──────────────────────────────────────────────────
+
+class ReceiveFromPhoneDialog(BaseDialog):
+    _TIMEOUT = 120
+
+    def __init__(self, parent, vault) -> None:
+        super().__init__(parent, "Receive from Phone", 320, 480)
+        self._vault   = vault
+        self._server: _PhoneImportServer | None = None
+        self._seconds = self._TIMEOUT
+        self._done    = False
+        self._start_server()
+        self._build()
+        self._tick_timer = QTimer(self)
+        self._tick_timer.timeout.connect(self._tick)
+        self._tick_timer.start(1000)
+        self._poll_timer = QTimer(self)
+        self._poll_timer.timeout.connect(self._poll)
+        self._poll_timer.start(300)
+
+    def _start_server(self) -> None:
+        port = _find_free_port()
+        token = secrets.token_urlsafe(16)
+        cert_path, key_path, _ = _ensure_export_cert()
+        fp = _cert_fingerprint(cert_path)
+        self._url = f"https://{_get_local_ip()}:{port}/import/{token}?fp={fp}"
+        self._server = _PhoneImportServer(self._vault, token, port, cert_path, key_path)
+
+    def _build(self) -> None:
+        self._header("Receive from Phone")
+        body = self._body_widget()
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(20, 16, 20, 16)
+        bl.setSpacing(10)
+        bl.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        hint = QLabel("On your phone, tap the sync button and scan this QR code:")
+        hint.setWordWrap(True)
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        bl.addWidget(hint)
+        bl.addSpacing(4)
+
+        try:
+            import qrcode as _qr
+            from PIL import Image as PilImage
+            qr = _qr.QRCode(box_size=7, border=2,
+                            error_correction=_qr.constants.ERROR_CORRECT_M)
+            qr.add_data(self._url)
+            qr.make(fit=True)
+            pil_img = qr.make_image(fill_color=(0, 0, 0),
+                                    back_color=(255, 255, 255)).convert("RGB")
+            buf = io.BytesIO()
+            pil_img.save(buf, format="PNG")
+            buf.seek(0)
+            px = QPixmap()
+            px.loadFromData(buf.read())
+            px = px.scaled(220, 220,
+                           Qt.AspectRatioMode.KeepAspectRatio,
+                           Qt.TransformationMode.FastTransformation)
+            img_lbl = QLabel()
+            img_lbl.setPixmap(px)
+            img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            bl.addWidget(img_lbl)
+        except Exception as _e:
+            bl.addWidget(QLabel(f"QR error: {_e}"))
+
+        url_e = QLineEdit(self._url)
+        url_e.setReadOnly(True)
+        url_e.setFixedHeight(28)
+        bl.addWidget(url_e)
+
+        self._status_lbl = QLabel(f"Waiting… (expires in {self._seconds}s)")
+        self._status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        bl.addWidget(self._status_lbl)
+
+        bl.addStretch(1)
+        cancel = _btn("Cancel")
+        cancel.setFixedHeight(36)
+        cancel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        cancel.clicked.connect(self.reject)
+        bl.addWidget(cancel)
+
+    def _tick(self) -> None:
+        if self._done:
+            return
+        self._seconds -= 1
+        if self._seconds <= 0:
+            self._finish(expired=True)
+            return
+        self._status_lbl.setText(f"Waiting… (expires in {self._seconds}s)")
+
+    def _poll(self) -> None:
+        if self._done or not self._server:
+            return
+        if self._server.received.is_set():
+            self._finish(expired=False)
+
+    def _finish(self, *, expired: bool) -> None:
+        self._done = True
+        self._tick_timer.stop()
+        self._poll_timer.stop()
+        if not expired and self._server:
+            if self._server.error:
+                self._status_lbl.setText(f"Error: {self._server.error}")
+                QTimer.singleShot(3000, self.reject)
+            else:
+                n = self._server.count
+                self._status_lbl.setText(
+                    f"Received {n} new credential{'s' if n != 1 else ''}!"
+                )
+                QTimer.singleShot(2000, self.accept)
         else:
             self.reject()
 
